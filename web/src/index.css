@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* shadcn-style tokens (dark theme). Kept minimal — extend as needed. */
+@theme {
+  --color-border: oklch(0.28 0.01 260);
+  --color-background: oklch(0.16 0.01 260);
+  --color-card: oklch(0.2 0.01 260);
+  --color-foreground: oklch(0.96 0 0);
+  --color-muted: oklch(0.65 0.01 260);
+  --color-primary: oklch(0.7 0.15 260);
+  --color-primary-foreground: oklch(0.16 0.01 260);
+  --color-destructive: oklch(0.62 0.2 20);
+}
+
+body {
+  @apply bg-background text-foreground;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
