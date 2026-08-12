@@ -54,7 +54,8 @@ func main() {
 	reconciler := reconcile.New(dockerClient, db, logger, *interval)
 	go reconciler.Run(ctx)
 
-	api := httpapi.New(db, dockerClient, token, logger)
+	envs := docker.NewManager(dockerClient)
+	api := httpapi.New(db, dockerClient, envs, token, logger)
 	mux := http.NewServeMux()
 	mux.Handle("/v1/", api)
 	mux.Handle("/healthz", api)

@@ -43,6 +43,16 @@ type Deployment struct {
 	UpdatedAt     int64  `json:"updated_at"`
 }
 
+// Environment is a remote Docker host reachable over SSH. LunaGate connects
+// using the server process's own SSH config/agent (~/.ssh) — no password or
+// key material is ever accepted or stored here.
+type Environment struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	SSHHost   string `json:"ssh_host"` // e.g. "deploy@10.0.0.5" or "user@host:2222"
+	CreatedAt int64  `json:"created_at"`
+}
+
 type Store struct{ db *sql.DB }
 
 func Open(path string) (*Store, error) {
@@ -77,6 +87,12 @@ func Open(path string) (*Store, error) {
 			webhook_secret TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS environments (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			ssh_host TEXT NOT NULL,
+			created_at INTEGER NOT NULL
 		);`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize schema: %w", err)
@@ -246,6 +262,63 @@ func (s *Store) UpdateDeployment(ctx context.Context, d Deployment) (Deployment,
 
 func (s *Store) DeleteDeployment(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM deployments WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) CreateEnvironment(ctx context.Context, e Environment) (Environment, error) {
+	e.ID = newID()
+	e.CreatedAt = time.Now().UTC().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO environments (id, name, ssh_host, created_at) VALUES (?, ?, ?, ?)`,
+		e.ID, e.Name, e.SSHHost, e.CreatedAt)
+	if err != nil {
+		return Environment{}, err
+	}
+	return e, nil
+}
+
+func (s *Store) ListEnvironments(ctx context.Context) ([]Environment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, ssh_host, created_at FROM environments ORDER BY name, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	envs := make([]Environment, 0)
+	for rows.Next() {
+		var e Environment
+		if err := rows.Scan(&e.ID, &e.Name, &e.SSHHost, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		envs = append(envs, e)
+	}
+	return envs, rows.Err()
+}
+
+func (s *Store) GetEnvironment(ctx context.Context, id string) (Environment, error) {
+	var e Environment
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, ssh_host, created_at FROM environments WHERE id = ?`, id).
+		Scan(&e.ID, &e.Name, &e.SSHHost, &e.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Environment{}, ErrNotFound
+	}
+	return e, err
+}
+
+func (s *Store) DeleteEnvironment(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM environments WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}

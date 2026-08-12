@@ -4,9 +4,18 @@ package docker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
+	"sync"
+	"time"
 
+	"github.com/docker/cli/cli/connhelper"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -71,11 +80,122 @@ func New() (*Client, error) {
 	return &Client{cli: cli}, nil
 }
 
+// sshCandidates are the usual install locations, tried when ssh is missing
+// from PATH.
+//
+// The Sysnative and ProgramW6432 entries matter for a 32-bit build on 64-bit
+// Windows: WOW64 redirects System32 to SysWOW64 (no OpenSSH there) and points
+// ProgramFiles at the x86 tree, so such a process cannot reach the real ssh.exe
+// through the paths PATH advertises. Sysnative and ProgramW6432 are the
+// documented escapes, and exist only for that case.
+var sshCandidates = []string{
+	filepath.Join(os.Getenv("SystemRoot"), "Sysnative", "OpenSSH", "ssh.exe"),
+	filepath.Join(os.Getenv("SystemRoot"), "System32", "OpenSSH", "ssh.exe"),
+	filepath.Join(os.Getenv("ProgramW6432"), "Git", "usr", "bin", "ssh.exe"),
+	filepath.Join(os.Getenv("ProgramFiles"), "Git", "usr", "bin", "ssh.exe"),
+	filepath.Join(os.Getenv("ProgramW6432"), "OpenSSH", "ssh.exe"),
+	filepath.Join(os.Getenv("ProgramFiles"), "OpenSSH", "ssh.exe"),
+}
+
+var ensureSSHOnce = sync.OnceValue(func() error {
+	if _, err := exec.LookPath("ssh"); err == nil {
+		return nil
+	}
+	for _, candidate := range sshCandidates {
+		if _, err := os.Stat(candidate); err != nil {
+			continue
+		}
+		// connhelper shells out to bare "ssh", so the directory has to be on
+		// PATH; pointing at the binary directly is not an option it offers.
+		os.Setenv("PATH", filepath.Dir(candidate)+string(os.PathListSeparator)+os.Getenv("PATH"))
+		return nil
+	}
+	return errors.New("no ssh client found: install OpenSSH, or restart LunaGate from a shell where `ssh` works")
+})
+
+// NewSSH dials a remote Docker daemon over SSH, using the calling process's
+// own SSH config, known_hosts and agent (~/.ssh) — LunaGate never handles a
+// password or private key itself. sshHost is a plain target like
+// "user@host" or "user@host:2222".
+func NewSSH(sshHost string) (*Client, error) {
+	if err := ensureSSHOnce(); err != nil {
+		return nil, err
+	}
+	helper, err := connhelper.GetConnectionHelper("ssh://" + sshHost)
+	if err != nil {
+		return nil, err
+	}
+	cli, err := client.NewClientWithOpts(
+		client.WithHTTPClient(&http.Client{Transport: &http.Transport{DialContext: helper.Dialer}}),
+		client.WithHost(helper.Host),
+		client.WithDialContext(helper.Dialer),
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{cli: cli}, nil
+}
+
 func (c *Client) Close() error { return c.cli.Close() }
 
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.cli.Ping(ctx)
 	return err
+}
+
+// Manager hands out the local client plus one cached client per SSH target.
+// Caching matters here because the dashboard polls host state every few
+// seconds; without it, every poll would pay a fresh SSH handshake.
+type Manager struct {
+	local *Client
+	mu    sync.Mutex
+	cache map[string]*Client
+}
+
+func NewManager(local *Client) *Manager {
+	return &Manager{local: local, cache: map[string]*Client{}}
+}
+
+func (m *Manager) Local() *Client { return m.local }
+
+func (m *Manager) Remote(sshHost string) (*Client, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.cache[sshHost]; ok {
+		return c, nil
+	}
+	c, err := NewSSH(sshHost)
+	if err != nil {
+		return nil, fmt.Errorf("connect to %s: %w", sshHost, err)
+	}
+	m.cache[sshHost] = c
+	return c, nil
+}
+
+// Forget closes and evicts a cached remote client, e.g. when its environment
+// is deleted. A no-op if nothing was cached for sshHost.
+func (m *Manager) Forget(sshHost string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.cache[sshHost]; ok {
+		c.Close()
+		delete(m.cache, sshHost)
+	}
+}
+
+// Verify dials sshHost and pings it, without caching the connection. Used to
+// fail an environment's creation immediately if it's unreachable, rather
+// than the user discovering that on the first poll.
+func Verify(ctx context.Context, sshHost string) error {
+	c, err := NewSSH(sshHost)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	return c.Ping(ctx)
 }
 
 // PullImage drains the progress stream to completion; the API requires it

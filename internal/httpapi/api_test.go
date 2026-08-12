@@ -39,7 +39,7 @@ func TestAPILifecycle(t *testing.T) {
 	}
 	defer db.Close()
 
-	server := httptest.NewServer(httpapi.New(db, stubDocker{}, "secret", slog.New(slog.NewTextHandler(io.Discard, nil))))
+	server := httptest.NewServer(httpapi.New(db, stubDocker{}, nil, "secret", slog.New(slog.NewTextHandler(io.Discard, nil))))
 	defer server.Close()
 
 	request := func(method, path, body string, authenticated bool) (*http.Response, map[string]any) {

@@ -36,6 +36,7 @@ var slugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 type handler struct {
 	store     *store.Store
 	docker    containerOps
+	envs      *docker.Manager
 	adminHash [32]byte
 	logger    *slog.Logger
 }
@@ -47,8 +48,10 @@ type apiInput struct {
 	Spec        json.RawMessage `json:"spec"`
 }
 
-func New(db *store.Store, dockerOps containerOps, adminToken string, logger *slog.Logger) http.Handler {
-	h := &handler{store: db, docker: dockerOps, adminHash: sha256.Sum256([]byte(adminToken)), logger: logger}
+// envs resolves non-local environments (?env=<id> beyond "local"); it may be
+// nil if the caller never needs remote hosts.
+func New(db *store.Store, dockerOps containerOps, envs *docker.Manager, adminToken string, logger *slog.Logger) http.Handler {
+	h := &handler{store: db, docker: dockerOps, envs: envs, adminHash: sha256.Sum256([]byte(adminToken)), logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.health)
 	mux.HandleFunc("GET /readyz", h.ready)
@@ -68,6 +71,10 @@ func New(db *store.Store, dockerOps containerOps, adminToken string, logger *slo
 
 	mux.Handle("GET /v1/host/containers", h.authenticate(http.HandlerFunc(h.hostContainers)))
 	mux.Handle("GET /v1/host/images", h.authenticate(http.HandlerFunc(h.hostImages)))
+
+	mux.Handle("GET /v1/environments", h.authenticate(http.HandlerFunc(h.listEnvironments)))
+	mux.Handle("POST /v1/environments", h.authenticate(http.HandlerFunc(h.createEnvironment)))
+	mux.Handle("DELETE /v1/environments/{id}", h.authenticate(http.HandlerFunc(h.deleteEnvironment)))
 	// Logs use EventSource, which cannot set headers, so this route does its own
 	// token check (header or ?token=) instead of the authenticate middleware.
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", h.deploymentLogs)
@@ -289,21 +296,137 @@ func (h *handler) deploymentContainers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) hostContainers(w http.ResponseWriter, r *http.Request) {
-	containers, err := h.docker.ListAllContainers(r.Context())
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	containers, err := ops.ListAllContainers(r.Context())
 	if err != nil {
-		h.internalError(w, err)
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": containers})
 }
 
 func (h *handler) hostImages(w http.ResponseWriter, r *http.Request) {
-	images, err := h.docker.ListImages(r.Context())
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	images, err := ops.ListImages(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": images})
+}
+
+// resolveEnv picks the containerOps for ?env=<id>, defaulting to "local".
+// It writes the error response itself and returns ok=false on failure.
+func (h *handler) resolveEnv(w http.ResponseWriter, r *http.Request) (containerOps, bool) {
+	id := r.URL.Query().Get("env")
+	if id == "" || id == "local" {
+		return h.docker, true
+	}
+	env, err := h.store.GetEnvironment(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "environment not found")
+		return nil, false
+	}
+	if err != nil {
+		h.internalError(w, err)
+		return nil, false
+	}
+	if h.envs == nil {
+		h.internalError(w, errors.New("no environment manager configured"))
+		return nil, false
+	}
+	cli, err := h.envs.Remote(env.SSHHost)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return nil, false
+	}
+	return cli, true
+}
+
+func (h *handler) listEnvironments(w http.ResponseWriter, r *http.Request) {
+	envs, err := h.store.ListEnvironments(r.Context())
 	if err != nil {
 		h.internalError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": images})
+	items := make([]map[string]any, 0, len(envs)+1)
+	items = append(items, map[string]any{"id": "local", "name": "This machine", "kind": "local"})
+	for _, e := range envs {
+		items = append(items, map[string]any{
+			"id": e.ID, "name": e.Name, "kind": "ssh", "ssh_host": e.SSHHost, "created_at": e.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+type environmentInput struct {
+	Name    string `json:"name"`
+	SSHHost string `json:"ssh_host"`
+}
+
+// The user part is optional: a bare host lets ~/.ssh/config supply User (and
+// HostName, Port, IdentityFile), which is how most people already reach these
+// machines from a terminal.
+var sshHostPattern = regexp.MustCompile(`^([\w.-]+@)?[\w.-]+(:\d{1,5})?$`)
+
+func (h *handler) createEnvironment(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+	var in environmentInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.SSHHost = strings.TrimSpace(in.SSHHost)
+	if in.Name == "" || len(in.Name) > 120 {
+		writeError(w, http.StatusBadRequest, "validation_error", "name is required and must have at most 120 characters")
+		return
+	}
+	if !sshHostPattern.MatchString(in.SSHHost) {
+		writeError(w, http.StatusBadRequest, "validation_error", "ssh_host must look like host, user@host or user@host:port")
+		return
+	}
+	if err := docker.Verify(r.Context(), in.SSHHost); err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", "could not connect: "+err.Error())
+		return
+	}
+	env, err := h.store.CreateEnvironment(r.Context(), store.Environment{Name: in.Name, SSHHost: in.SSHHost})
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, env)
+}
+
+func (h *handler) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "local" {
+		writeError(w, http.StatusBadRequest, "validation_error", "the local environment cannot be removed")
+		return
+	}
+	env, err := h.store.GetEnvironment(r.Context(), id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "environment not found")
+		return
+	}
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	if err := h.store.DeleteEnvironment(r.Context(), id); err != nil {
+		h.internalError(w, err)
+		return
+	}
+	if h.envs != nil {
+		h.envs.Forget(env.SSHHost)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {

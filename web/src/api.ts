@@ -39,6 +39,14 @@ export type Image = {
   created: number;
 };
 
+export type Environment = {
+  id: string;
+  name: string;
+  kind: "local" | "ssh";
+  ssh_host?: string;
+  created_at?: number;
+};
+
 export type Port = { container: number; host: number };
 
 export type NewDeployment = {
@@ -82,11 +90,25 @@ export const redeploy = (id: string) =>
 export const listContainers = (id: string) =>
   req<{ items: Container[] }>(`/deployments/${id}/containers`).then((d) => d.items);
 
-export const listHostContainers = () =>
-  req<{ items: HostContainer[] }>("/host/containers").then((d) => d.items);
+export const listHostContainers = (env: string) =>
+  req<{ items: HostContainer[] }>(`/host/containers?env=${encodeURIComponent(env)}`).then(
+    (d) => d.items,
+  );
 
-export const listImages = () =>
-  req<{ items: Image[] }>("/host/images").then((d) => d.items);
+export const listImages = (env: string) =>
+  req<{ items: Image[] }>(`/host/images?env=${encodeURIComponent(env)}`).then((d) => d.items);
+
+export const listEnvironments = () =>
+  req<{ items: Environment[] }>("/environments").then((d) => d.items);
+
+export const createEnvironment = (name: string, sshHost: string) =>
+  req<Environment>("/environments", {
+    method: "POST",
+    body: JSON.stringify({ name, ssh_host: sshHost }),
+  });
+
+export const deleteEnvironment = (id: string) =>
+  req<null>(`/environments/${id}`, { method: "DELETE" });
 
 // EventSource can't send headers, so the token rides as a query param.
 export const logsURL = (id: string) =>
