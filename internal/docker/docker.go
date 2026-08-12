@@ -3,11 +3,14 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +24,8 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 const (
@@ -113,11 +118,21 @@ var ensureSSHOnce = sync.OnceValue(func() error {
 	return errors.New("no ssh client found: install OpenSSH, or restart LunaGate from a shell where `ssh` works")
 })
 
-// NewSSH dials a remote Docker daemon over SSH, using the calling process's
-// own SSH config, known_hosts and agent (~/.ssh) — LunaGate never handles a
-// password or private key itself. sshHost is a plain target like
-// "user@host" or "user@host:2222".
-func NewSSH(sshHost string) (*Client, error) {
+var knownHostsFile = func() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".ssh", "known_hosts"), nil
+}
+
+// NewSSH dials a remote Docker daemon over SSH. An empty password uses the
+// system OpenSSH client (config, keys and agent); otherwise it uses password
+// authentication and validates the host against ~/.ssh/known_hosts.
+func NewSSH(sshHost, password string) (*Client, error) {
+	if password != "" {
+		return newPasswordSSH(sshHost, password)
+	}
 	if err := ensureSSHOnce(); err != nil {
 		return nil, err
 	}
@@ -136,6 +151,104 @@ func NewSSH(sshHost string) (*Client, error) {
 	}
 	return &Client{cli: cli}, nil
 }
+
+func newPasswordSSH(sshHost, password string) (*Client, error) {
+	target, err := url.Parse("ssh://" + sshHost)
+	if err != nil || target.User == nil || target.User.Username() == "" {
+		return nil, errors.New("password authentication requires user@host")
+	}
+	port := target.Port()
+	if port == "" {
+		port = "22"
+	}
+	address := net.JoinHostPort(target.Hostname(), port)
+	knownHosts, err := knownHostsFile()
+	if err != nil {
+		return nil, fmt.Errorf("find SSH home: %w", err)
+	}
+	hostKeyCallback, err := knownhosts.New(knownHosts)
+	if err != nil {
+		return nil, fmt.Errorf("read known_hosts: %w", err)
+	}
+	config := &ssh.ClientConfig{
+		User:            target.User.Username(),
+		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyCallback: hostKeyCallback,
+		Timeout:         8 * time.Second,
+	}
+	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		dialer := net.Dialer{Timeout: 8 * time.Second}
+		tcp, err := dialer.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		connection, channels, requests, err := ssh.NewClientConn(tcp, address, config)
+		if err != nil {
+			tcp.Close()
+			return nil, fmt.Errorf("SSH authentication failed: %w", err)
+		}
+		client := ssh.NewClient(connection, channels, requests)
+		session, err := client.NewSession()
+		if err != nil {
+			client.Close()
+			return nil, err
+		}
+		stdin, err := session.StdinPipe()
+		if err != nil {
+			session.Close()
+			client.Close()
+			return nil, err
+		}
+		stdout, err := session.StdoutPipe()
+		if err != nil {
+			session.Close()
+			client.Close()
+			return nil, err
+		}
+		conn := &sshCommandConn{client: client, session: session, stdin: stdin, stdout: stdout}
+		session.Stderr = &conn.stderr
+		if err := session.Start("docker system dial-stdio"); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("start remote Docker: %w", err)
+		}
+		return conn, nil
+	}
+	return newClientWithDialer(dial)
+}
+
+func newClientWithDialer(dial func(context.Context, string, string) (net.Conn, error)) (*Client, error) {
+	cli, err := client.NewClientWithOpts(
+		client.WithHTTPClient(&http.Client{Transport: &http.Transport{DialContext: dial}}),
+		client.WithHost("http://docker.example.com"),
+		client.WithDialContext(dial),
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{cli: cli}, nil
+}
+
+type sshCommandConn struct {
+	client  *ssh.Client
+	session *ssh.Session
+	stdin   io.WriteCloser
+	stdout  io.Reader
+	stderr  bytes.Buffer
+}
+
+func (c *sshCommandConn) Read(p []byte) (int, error)  { return c.stdout.Read(p) }
+func (c *sshCommandConn) Write(p []byte) (int, error) { return c.stdin.Write(p) }
+func (c *sshCommandConn) Close() error {
+	c.stdin.Close()
+	c.session.Close()
+	return c.client.Close()
+}
+func (c *sshCommandConn) LocalAddr() net.Addr              { return c.client.LocalAddr() }
+func (c *sshCommandConn) RemoteAddr() net.Addr             { return c.client.RemoteAddr() }
+func (c *sshCommandConn) SetDeadline(time.Time) error      { return nil }
+func (c *sshCommandConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *sshCommandConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (c *Client) Close() error { return c.cli.Close() }
 
@@ -159,13 +272,13 @@ func NewManager(local *Client) *Manager {
 
 func (m *Manager) Local() *Client { return m.local }
 
-func (m *Manager) Remote(sshHost string) (*Client, error) {
+func (m *Manager) Remote(sshHost, password string) (*Client, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if c, ok := m.cache[sshHost]; ok {
 		return c, nil
 	}
-	c, err := NewSSH(sshHost)
+	c, err := NewSSH(sshHost, password)
 	if err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", sshHost, err)
 	}
@@ -187,8 +300,8 @@ func (m *Manager) Forget(sshHost string) {
 // Verify dials sshHost and pings it, without caching the connection. Used to
 // fail an environment's creation immediately if it's unreachable, rather
 // than the user discovering that on the first poll.
-func Verify(ctx context.Context, sshHost string) error {
-	c, err := NewSSH(sshHost)
+func Verify(ctx context.Context, sshHost, password string) error {
+	c, err := NewSSH(sshHost, password)
 	if err != nil {
 		return err
 	}

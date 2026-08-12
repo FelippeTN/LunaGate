@@ -3,9 +3,13 @@ package httpapi
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -341,7 +345,12 @@ func (h *handler) resolveEnv(w http.ResponseWriter, r *http.Request) (containerO
 		h.internalError(w, errors.New("no environment manager configured"))
 		return nil, false
 	}
-	cli, err := h.envs.Remote(env.SSHHost)
+	password, err := h.openCredential(env.SSHPassword)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", "could not decrypt the SSH password; remove and add this environment again")
+		return nil, false
+	}
+	cli, err := h.envs.Remote(env.SSHHost, password)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
 		return nil, false
@@ -366,8 +375,9 @@ func (h *handler) listEnvironments(w http.ResponseWriter, r *http.Request) {
 }
 
 type environmentInput struct {
-	Name    string `json:"name"`
-	SSHHost string `json:"ssh_host"`
+	Name     string `json:"name"`
+	SSHHost  string `json:"ssh_host"`
+	Password string `json:"password"`
 }
 
 // The user part is optional: a bare host lets ~/.ssh/config supply User (and
@@ -392,16 +402,68 @@ func (h *handler) createEnvironment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "validation_error", "ssh_host must look like host, user@host or user@host:port")
 		return
 	}
-	if err := docker.Verify(r.Context(), in.SSHHost); err != nil {
+	if in.Password != "" && !strings.Contains(in.SSHHost, "@") {
+		writeError(w, http.StatusBadRequest, "validation_error", "password authentication requires user@host")
+		return
+	}
+	if len(in.Password) > 4096 {
+		writeError(w, http.StatusBadRequest, "validation_error", "password must have at most 4096 characters")
+		return
+	}
+	if err := docker.Verify(r.Context(), in.SSHHost, in.Password); err != nil {
 		writeError(w, http.StatusBadGateway, "environment_unreachable", "could not connect: "+err.Error())
 		return
 	}
-	env, err := h.store.CreateEnvironment(r.Context(), store.Environment{Name: in.Name, SSHHost: in.SSHHost})
+	secret, err := h.sealCredential(in.Password)
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	env, err := h.store.CreateEnvironment(r.Context(), store.Environment{Name: in.Name, SSHHost: in.SSHHost, SSHPassword: secret})
 	if err != nil {
 		h.internalError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, env)
+}
+
+func (h *handler) sealCredential(plain string) (string, error) {
+	if plain == "" {
+		return "", nil
+	}
+	block, err := aes.NewCipher(h.adminHash[:])
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(gcm.Seal(nonce, nonce, []byte(plain), nil)), nil
+}
+
+func (h *handler) openCredential(encoded string) (string, error) {
+	if encoded == "" {
+		return "", nil
+	}
+	payload, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(h.adminHash[:])
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil || len(payload) < gcm.NonceSize() {
+		return "", errors.New("invalid encrypted credential")
+	}
+	plain, err := gcm.Open(nil, payload[:gcm.NonceSize()], payload[gcm.NonceSize():], nil)
+	return string(plain), err
 }
 
 func (h *handler) deleteEnvironment(w http.ResponseWriter, r *http.Request) {

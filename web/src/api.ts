@@ -101,10 +101,10 @@ export const listImages = (env: string) =>
 export const listEnvironments = () =>
   req<{ items: Environment[] }>("/environments").then((d) => d.items);
 
-export const createEnvironment = (name: string, sshHost: string) =>
+export const createEnvironment = (name: string, sshHost: string, password: string) =>
   req<Environment>("/environments", {
     method: "POST",
-    body: JSON.stringify({ name, ssh_host: sshHost }),
+    body: JSON.stringify({ name, ssh_host: sshHost, password }),
   });
 
 export const deleteEnvironment = (id: string) =>

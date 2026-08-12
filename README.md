@@ -95,6 +95,12 @@ hot reload, run the Go server and Vite side by side (Vite proxies `/v1` to
 npm run dev            # in web/, serves http://localhost:5173
 ```
 
+Remote environments can authenticate with the server's SSH key/agent or with
+an SSH password entered in the UI. For password authentication, use a target
+such as `user@host`; the password is encrypted with the admin token before it
+is stored. The host must already exist in the LunaGate server user's
+`~/.ssh/known_hosts`, and the remote user must be allowed to run Docker.
+
 ## Development
 
 ```powershell

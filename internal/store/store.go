@@ -43,14 +43,14 @@ type Deployment struct {
 	UpdatedAt     int64  `json:"updated_at"`
 }
 
-// Environment is a remote Docker host reachable over SSH. LunaGate connects
-// using the server process's own SSH config/agent (~/.ssh) — no password or
-// key material is ever accepted or stored here.
+// Environment is a remote Docker host reachable over SSH. Passwords are
+// optional and stored only as authenticated ciphertext.
 type Environment struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	SSHHost   string `json:"ssh_host"` // e.g. "deploy@10.0.0.5" or "user@host:2222"
-	CreatedAt int64  `json:"created_at"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	SSHHost     string `json:"ssh_host"` // e.g. "deploy@10.0.0.5" or "user@host:2222"
+	SSHPassword string `json:"-"`        // AES-GCM ciphertext; never returned by the API
+	CreatedAt   int64  `json:"created_at"`
 }
 
 type Store struct{ db *sql.DB }
@@ -92,10 +92,17 @@ func Open(path string) (*Store, error) {
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			ssh_host TEXT NOT NULL,
+			ssh_password TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL
 		);`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize schema: %w", err)
+	}
+	// Existing databases predate password authentication.
+	if _, err = db.Exec(`ALTER TABLE environments ADD COLUMN ssh_password TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, fmt.Errorf("migrate environments: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -279,8 +286,8 @@ func (s *Store) CreateEnvironment(ctx context.Context, e Environment) (Environme
 	e.ID = newID()
 	e.CreatedAt = time.Now().UTC().Unix()
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO environments (id, name, ssh_host, created_at) VALUES (?, ?, ?, ?)`,
-		e.ID, e.Name, e.SSHHost, e.CreatedAt)
+		INSERT INTO environments (id, name, ssh_host, ssh_password, created_at) VALUES (?, ?, ?, ?, ?)`,
+		e.ID, e.Name, e.SSHHost, e.SSHPassword, e.CreatedAt)
 	if err != nil {
 		return Environment{}, err
 	}
@@ -289,7 +296,7 @@ func (s *Store) CreateEnvironment(ctx context.Context, e Environment) (Environme
 
 func (s *Store) ListEnvironments(ctx context.Context) ([]Environment, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, ssh_host, created_at FROM environments ORDER BY name, id`)
+		SELECT id, name, ssh_host, ssh_password, created_at FROM environments ORDER BY name, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +305,7 @@ func (s *Store) ListEnvironments(ctx context.Context) ([]Environment, error) {
 	envs := make([]Environment, 0)
 	for rows.Next() {
 		var e Environment
-		if err := rows.Scan(&e.ID, &e.Name, &e.SSHHost, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Name, &e.SSHHost, &e.SSHPassword, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		envs = append(envs, e)
@@ -309,8 +316,8 @@ func (s *Store) ListEnvironments(ctx context.Context) ([]Environment, error) {
 func (s *Store) GetEnvironment(ctx context.Context, id string) (Environment, error) {
 	var e Environment
 	err := s.db.QueryRowContext(ctx, `
-		SELECT id, name, ssh_host, created_at FROM environments WHERE id = ?`, id).
-		Scan(&e.ID, &e.Name, &e.SSHHost, &e.CreatedAt)
+		SELECT id, name, ssh_host, ssh_password, created_at FROM environments WHERE id = ?`, id).
+		Scan(&e.ID, &e.Name, &e.SSHHost, &e.SSHPassword, &e.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Environment{}, ErrNotFound
 	}

@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Activity,
   Boxes,
+  Eye,
+  EyeOff,
   Laptop,
   Layers,
+  LayoutDashboard,
   LogOut,
   Menu,
   Moon,
@@ -33,7 +37,6 @@ import {
   type Deployment,
   type Environment,
   type HostContainer,
-  type Image as DockerImage,
   type NewDeployment,
 } from "@/api";
 import {
@@ -115,9 +118,7 @@ function TokenGate({ onDone }: { onDone: () => void }) {
     <div className="grid min-h-screen place-items-center bg-background p-4">
       <div className="w-full max-w-sm">
         <div className="mb-6 flex items-center gap-2.5">
-          <div className="grid size-9 place-items-center rounded-lg bg-primary/15">
-            <Boxes className="size-5 text-primary" />
-          </div>
+          <img src="/lunagate.svg" alt="" className="size-9 rounded-lg" />
           <div>
             <h1 className="text-base font-semibold leading-tight">LunaGate</h1>
             <p className="text-xs text-muted-foreground">Container control plane</p>
@@ -155,9 +156,15 @@ function TokenGate({ onDone }: { onDone: () => void }) {
   );
 }
 
-type Tab = "deployments" | "containers" | "images";
+type Tab = "overview" | "deployments" | "containers" | "images";
 
 const TABS: { id: Tab; label: string; icon: typeof Boxes; description: string }[] = [
+  {
+    id: "overview",
+    label: "Overview",
+    icon: LayoutDashboard,
+    description: "Health and workload across your LunaGate environments.",
+  },
   {
     id: "deployments",
     label: "Deployments",
@@ -181,7 +188,7 @@ const TABS: { id: Tab; label: string; icon: typeof Boxes; description: string }[
 const LOCAL_ENV: Environment = { id: "local", name: "This machine", kind: "local" };
 
 function Dashboard({ onLogout }: { onLogout: () => void }) {
-  const [tab, setTab] = useState<Tab>("deployments");
+  const [tab, setTab] = useState<Tab>("overview");
   const [navOpen, setNavOpen] = useState(false);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [localContainers, setLocalContainers] = useState<HostContainer[]>([]);
@@ -190,6 +197,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [creating, setCreating] = useState(false);
   const [logsFor, setLogsFor] = useState<Deployment | null>(null);
   const [created, setCreated] = useState<Deployment | null>(null);
+  const [overviewRefresh, setOverviewRefresh] = useState(0);
   const { theme, toggle } = useTheme();
 
   const [environments, setEnvironments] = useState<Environment[]>([LOCAL_ENV]);
@@ -231,6 +239,9 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const desiredReplicas = deployments.reduce((n, d) => n + d.replicas, 0);
   const runningReplicas = deployments.reduce((n, d) => n + (runningByDeployment.get(d.id) ?? 0), 0);
   const runningContainers = localContainers.filter((c) => c.state === "running").length;
+  const healthyDeployments = deployments.filter(
+    (d) => (runningByDeployment.get(d.id) ?? 0) >= d.replicas,
+  ).length;
 
   const active = TABS.find((t) => t.id === tab)!;
 
@@ -252,9 +263,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
         )}
       >
         <div className="flex h-14 items-center gap-2.5 px-4">
-          <div className="grid size-8 place-items-center rounded-lg bg-primary/15">
-            <Boxes className="size-4.5 text-primary" />
-          </div>
+          <img src="/lunagate.svg" alt="" className="size-8 rounded-lg" />
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold leading-tight">LunaGate</p>
             <p className="truncate text-[11px] text-muted-foreground">Control plane</p>
@@ -339,11 +348,18 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
             </p>
           </div>
           <div className="ml-auto flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={() => refresh()}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                refresh();
+                setOverviewRefresh((value) => value + 1);
+              }}
+            >
               <RefreshCw className="size-4" />
               <span className="hidden sm:inline">Refresh</span>
             </Button>
-            {tab === "deployments" && (
+            {(tab === "overview" || tab === "deployments") && (
               <Button size="sm" onClick={() => setCreating(true)}>
                 <Plus className="size-4" />
                 <span className="hidden sm:inline">New deployment</span>
@@ -356,9 +372,18 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
           <SummaryBar
             loading={loading}
             stats={[
-              { label: "Deployments", value: String(deployments.length) },
               {
-                label: "Replicas",
+                label: "Healthy deployments",
+                value: `${healthyDeployments}/${deployments.length}`,
+                tone:
+                  deployments.length === 0
+                    ? "neutral"
+                    : healthyDeployments === deployments.length
+                      ? "good"
+                      : "bad",
+              },
+              {
+                label: "Managed replicas",
                 value: `${runningReplicas}/${desiredReplicas}`,
                 tone:
                   desiredReplicas === 0
@@ -368,10 +393,10 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
                       : "bad",
               },
               {
-                label: "This machine",
+                label: "Local containers",
                 value: `${runningContainers}/${localContainers.length}`,
               },
-              { label: "Environments", value: String(environments.length) },
+              { label: "Servers", value: String(environments.length) },
             ]}
           />
 
@@ -381,6 +406,16 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
             </Card>
           )}
 
+          {tab === "overview" && (
+            <OverviewPanel
+              deployments={deployments}
+              running={runningByDeployment}
+              environments={environments}
+              localContainers={localContainers}
+              loading={loading}
+              refreshKey={overviewRefresh}
+            />
+          )}
           {tab === "deployments" && (
             <DeploymentsPanel
               deployments={deployments}
@@ -424,6 +459,209 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
       )}
       {created && <WebhookInfo deployment={created} onClose={() => setCreated(null)} />}
       {logsFor && <LogsPanel deployment={logsFor} onClose={() => setLogsFor(null)} />}
+    </div>
+  );
+}
+
+type EnvironmentSnapshot = {
+  environment: Environment;
+  containers: HostContainer[];
+  error?: string;
+  loading: boolean;
+};
+
+function OverviewPanel({
+  deployments,
+  running,
+  environments,
+  localContainers,
+  loading,
+  refreshKey,
+}: {
+  deployments: Deployment[];
+  running: Map<string, number>;
+  environments: Environment[];
+  localContainers: HostContainer[];
+  loading: boolean;
+  refreshKey: number;
+}) {
+  const [remoteSnapshots, setRemoteSnapshots] = useState<
+    Record<string, { containers: HostContainer[]; error?: string }>
+  >({});
+
+  useEffect(() => {
+    let alive = true;
+    const remotes = environments.filter((environment) => environment.id !== "local");
+
+    async function refreshRemotes() {
+      const results = await Promise.all(
+        remotes.map(async (environment) => {
+          try {
+            return [environment.id, { containers: await listHostContainers(environment.id) }] as const;
+          } catch (error) {
+            return [
+              environment.id,
+              { containers: [], error: (error as Error).message },
+            ] as const;
+          }
+        }),
+      );
+      if (alive) setRemoteSnapshots(Object.fromEntries(results));
+    }
+
+    refreshRemotes();
+    const timer = setInterval(refreshRemotes, 10000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [environments, refreshKey]);
+
+  const snapshots: EnvironmentSnapshot[] = environments.map((environment) => {
+    if (environment.id === "local") {
+      return { environment, containers: localContainers, loading };
+    }
+    const snapshot = remoteSnapshots[environment.id];
+    return {
+      environment,
+      containers: snapshot?.containers ?? [],
+      error: snapshot?.error,
+      loading: !snapshot,
+    };
+  });
+  const maxContainers = Math.max(1, ...snapshots.map((item) => item.containers.length));
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-2">
+      <Card className="overflow-hidden">
+        <CardHeader>
+          <div>
+            <CardTitle>Deployment capacity</CardTitle>
+            <CardDescription>Running replicas compared with the desired state.</CardDescription>
+          </div>
+          <Activity className="size-4 text-muted-foreground" />
+        </CardHeader>
+        <div className="space-y-5 p-4">
+          {loading && Array.from({ length: 3 }).map((_, index) => (
+            <Skeleton key={index} className="h-10 w-full" />
+          ))}
+          {!loading && deployments.length === 0 && (
+            <EmptyOverview
+              title="No workload to chart"
+              description="Create a deployment to start tracking replica health here."
+            />
+          )}
+          {deployments.map((deployment) => {
+            const live = running.get(deployment.id) ?? 0;
+            const healthy = live >= deployment.replicas;
+            const percentage = Math.min(100, (live / Math.max(1, deployment.replicas)) * 100);
+            return (
+              <div key={deployment.id}>
+                <div className="mb-2 flex items-center justify-between gap-3 text-xs">
+                  <div className="min-w-0">
+                    <span className="font-medium text-foreground">{deployment.name}</span>
+                    <span className="ml-2 truncate font-mono text-muted-foreground">
+                      {deployment.slug}
+                    </span>
+                  </div>
+                  <Badge variant={healthy ? "success" : "warning"} className="tabular shrink-0">
+                    {live}/{deployment.replicas}
+                  </Badge>
+                </div>
+                <div
+                  className="h-2 overflow-hidden rounded-full bg-muted"
+                  role="progressbar"
+                  aria-label={`${deployment.name}: ${live} of ${deployment.replicas} replicas running`}
+                  aria-valuemin={0}
+                  aria-valuemax={deployment.replicas}
+                  aria-valuenow={live}
+                >
+                  <div
+                    className={cn("h-full rounded-full", healthy ? "bg-success" : "bg-warning")}
+                    style={{ width: `${percentage}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      <Card className="overflow-hidden">
+        <CardHeader>
+          <div>
+            <CardTitle>Containers by server</CardTitle>
+            <CardDescription>Live workload across local and SSH environments.</CardDescription>
+          </div>
+          <Badge variant="muted" className="tabular">
+            {snapshots.filter((item) => !item.loading && !item.error).length}/{snapshots.length} online
+          </Badge>
+        </CardHeader>
+        <div className="space-y-4 p-4">
+          {snapshots.map(({ environment, containers, error, loading: serverLoading }) => {
+            const runningCount = containers.filter((container) => container.state === "running").length;
+            const stoppedCount = containers.length - runningCount;
+            const Icon = environment.kind === "local" ? Laptop : Wifi;
+            return (
+              <div key={environment.id}>
+                <div className="mb-2 flex items-center gap-2">
+                  <Icon className="size-4 text-muted-foreground" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-xs font-medium">{environment.name}</p>
+                    <p className="truncate text-[11px] text-muted-foreground">
+                      {environment.kind === "local" ? "localhost" : environment.ssh_host}
+                    </p>
+                  </div>
+                  {serverLoading ? (
+                    <Skeleton className="h-5 w-14" />
+                  ) : error ? (
+                    <Badge variant="destructive">Offline</Badge>
+                  ) : (
+                    <span className="tabular text-xs text-muted-foreground">
+                      {runningCount}/{containers.length} running
+                    </span>
+                  )}
+                </div>
+                {error ? (
+                  <p className="truncate pl-6 text-xs text-destructive" title={error}>
+                    {error}
+                  </p>
+                ) : serverLoading ? (
+                  <Skeleton className="ml-6 h-2 w-[calc(100%-1.5rem)]" />
+                ) : (
+                  <div className="ml-6 flex h-2 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="bg-success"
+                      style={{ width: `${(runningCount / maxContainers) * 100}%` }}
+                    />
+                    <div
+                      className="bg-warning"
+                      style={{ width: `${(stoppedCount / maxContainers) * 100}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div className="flex gap-4 border-t border-border px-4 py-3 text-[11px] text-muted-foreground">
+          <span className="flex items-center gap-1.5">
+            <span className="size-2 rounded-full bg-success" /> Running
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="size-2 rounded-full bg-warning" /> Stopped
+          </span>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function EmptyOverview({ title, description }: { title: string; description: string }) {
+  return (
+    <div className="py-8 text-center">
+      <p className="text-sm font-medium">{title}</p>
+      <p className="mt-1 text-xs text-muted-foreground">{description}</p>
     </div>
   );
 }
@@ -840,6 +1078,8 @@ function AddEnvironmentDialog({
   const ref = useRef<HTMLDialogElement>(null);
   const [name, setName] = useState("");
   const [sshHost, setSshHost] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -850,7 +1090,7 @@ function AddEnvironmentDialog({
     setSaving(true);
     setError("");
     try {
-      onCreated(await createEnvironment(name.trim(), sshHost.trim()));
+      onCreated(await createEnvironment(name.trim(), sshHost.trim(), password));
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -880,10 +1120,8 @@ function AddEnvironmentDialog({
 
         <div className="space-y-4 px-5 py-4">
           <p className="text-xs text-muted-foreground">
-            LunaGate connects using this server's own SSH configuration — its keys and{" "}
-            <code className="rounded bg-muted px-1 py-0.5">~/.ssh/config</code>. No password or
-            key is entered here; make sure the server can already <code>ssh</code> into the
-            target non-interactively.
+            Use the server's SSH key/config, or enter the account password below. Passwords are
+            encrypted before being stored and are never returned by the API.
           </p>
           <Field label="Name" hint="Shown on the card.">
             <Input
@@ -905,6 +1143,29 @@ function AddEnvironmentDialog({
               onChange={(e) => setSshHost(e.target.value)}
               placeholder="10.0.0.5 or deploy@10.0.0.5"
             />
+          </Field>
+          <Field
+            label="SSH password (optional)"
+            hint="For password login, include the user in the target: user@host."
+          >
+            <div className="relative">
+              <Input
+                type={showPassword ? "text" : "password"}
+                autoComplete="current-password"
+                className="pr-10"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Leave blank to use an SSH key"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((value) => !value)}
+                className="absolute inset-y-0 right-0 grid w-10 place-items-center text-muted-foreground hover:text-foreground"
+                aria-label={showPassword ? "Hide password" : "Show password"}
+              >
+                {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+              </button>
+            </div>
           </Field>
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
