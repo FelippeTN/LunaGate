@@ -17,8 +17,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/FelippeTN/LunaGate/internal/docker"
 	"github.com/FelippeTN/LunaGate/internal/store"
@@ -43,6 +47,21 @@ type handler struct {
 	envs      *docker.Manager
 	adminHash [32]byte
 	logger    *slog.Logger
+	metrics   requestMetrics
+}
+
+type metricBucket struct {
+	second   int64
+	requests uint64
+	latency  time.Duration
+	status   [3]uint64
+}
+
+type requestMetrics struct {
+	mu      sync.Mutex
+	started time.Time
+	total   uint64
+	buckets [60]metricBucket
 }
 
 type apiInput struct {
@@ -56,9 +75,12 @@ type apiInput struct {
 // nil if the caller never needs remote hosts.
 func New(db *store.Store, dockerOps containerOps, envs *docker.Manager, adminToken string, logger *slog.Logger) http.Handler {
 	h := &handler{store: db, docker: dockerOps, envs: envs, adminHash: sha256.Sum256([]byte(adminToken)), logger: logger}
+	h.metrics.started = time.Now()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.health)
 	mux.HandleFunc("GET /readyz", h.ready)
+	mux.HandleFunc("/gateway/{slug}", h.gateway)
+	mux.HandleFunc("/gateway/{slug}/{path...}", h.gateway)
 	mux.Handle("GET /v1/apis", h.authenticate(http.HandlerFunc(h.listAPIs)))
 	mux.Handle("POST /v1/apis", h.authenticate(http.HandlerFunc(h.createAPI)))
 	mux.Handle("GET /v1/apis/{id}", h.authenticate(http.HandlerFunc(h.getAPI)))
@@ -75,6 +97,7 @@ func New(db *store.Store, dockerOps containerOps, envs *docker.Manager, adminTok
 
 	mux.Handle("GET /v1/host/containers", h.authenticate(http.HandlerFunc(h.hostContainers)))
 	mux.Handle("GET /v1/host/images", h.authenticate(http.HandlerFunc(h.hostImages)))
+	mux.Handle("GET /v1/metrics", h.authenticate(http.HandlerFunc(h.getMetrics)))
 
 	mux.Handle("GET /v1/environments", h.authenticate(http.HandlerFunc(h.listEnvironments)))
 	mux.Handle("POST /v1/environments", h.authenticate(http.HandlerFunc(h.createEnvironment)))
@@ -323,6 +346,64 @@ func (h *handler) hostImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": images})
+}
+
+func (h *handler) getMetrics(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, h.metrics.snapshot(time.Now()))
+}
+
+func (h *handler) gateway(w http.ResponseWriter, r *http.Request) {
+	d, err := h.store.GetDeploymentBySlug(r.Context(), r.PathValue("slug"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "deployment not found")
+		return
+	}
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	containers, err := h.docker.ListByDeployment(r.Context(), d.ID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "docker_unavailable", "could not check container state")
+		return
+	}
+	running := false
+	for _, container := range containers {
+		if container.State == "running" {
+			running = true
+			break
+		}
+	}
+	if !running {
+		writeError(w, http.StatusServiceUnavailable, "deployment_unavailable", "deployment has no running containers")
+		return
+	}
+	var ports []docker.Port
+	if err := json.Unmarshal([]byte(d.Ports), &ports); err != nil {
+		h.internalError(w, err)
+		return
+	}
+	if len(ports) == 0 {
+		writeError(w, http.StatusServiceUnavailable, "port_unavailable", "deployment has no published port")
+		return
+	}
+
+	originalPath, originalRawPath := r.URL.Path, r.URL.RawPath
+	r.URL.Path = "/" + r.PathValue("path")
+	r.URL.RawPath = ""
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
+		Scheme: "http",
+		Host:   fmt.Sprintf("127.0.0.1:%d", ports[0].Host),
+	})
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		h.logger.Error("gateway request failed", "deployment", d.ID, "error", err)
+		writeError(w, http.StatusBadGateway, "upstream_unavailable", "running container did not accept the request")
+	}
+	started := time.Now()
+	response := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+	proxy.ServeHTTP(response, r)
+	r.URL.Path, r.URL.RawPath = originalPath, originalRawPath
+	h.metrics.record(time.Now(), response.status, time.Since(started))
 }
 
 // resolveEnv picks the containerOps for ?env=<id>, defaulting to "local".
@@ -687,9 +768,104 @@ func (h *handler) validToken(token string) bool {
 
 func (h *handler) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h.logger.Info("http request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
-		next.ServeHTTP(w, r)
+		started := time.Now()
+		response := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(response, r)
+		duration := time.Since(started)
+		h.logger.Info("http request", "method", r.Method, "path", r.URL.Path, "status", response.status, "duration", duration, "remote", r.RemoteAddr)
 	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(body []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *statusWriter) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (m *requestMetrics) record(now time.Time, status int, latency time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	class := statusClass(status)
+	m.total++
+	second := now.Unix()
+	bucket := &m.buckets[second%int64(len(m.buckets))]
+	if bucket.second != second {
+		*bucket = metricBucket{second: second}
+	}
+	bucket.requests++
+	bucket.latency += latency
+	bucket.status[class]++
+}
+
+func (m *requestMetrics) snapshot(now time.Time) map[string]any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var requests uint64
+	var latency time.Duration
+	var statuses [3]uint64
+	cutoff := now.Unix() - 59
+	for _, bucket := range m.buckets {
+		if bucket.second < cutoff {
+			continue
+		}
+		requests += bucket.requests
+		latency += bucket.latency
+		for i := range statuses {
+			statuses[i] += bucket.status[i]
+		}
+	}
+	averageLatency := float64(0)
+	if requests > 0 {
+		averageLatency = float64(latency.Microseconds()) / 1000 / float64(requests)
+	}
+	return map[string]any{
+		"total_requests":       m.total,
+		"requests_last_minute": requests,
+		"average_latency_ms":   averageLatency,
+		"uptime_seconds":       int64(now.Sub(m.started).Seconds()),
+		"last_minute": map[string]uint64{
+			"success": statuses[0], "client_error": statuses[1], "server_error": statuses[2],
+		},
+	}
+}
+
+func statusClass(status int) int {
+	if status >= 500 {
+		return 2
+	}
+	if status >= 400 {
+		return 1
+	}
+	return 0
 }
 
 func (h *handler) internalError(w http.ResponseWriter, err error) {

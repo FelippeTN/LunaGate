@@ -244,6 +244,17 @@ func (s *Store) GetDeployment(ctx context.Context, id string) (Deployment, error
 	return d, err
 }
 
+func (s *Store) GetDeploymentBySlug(ctx context.Context, slug string) (Deployment, error) {
+	var d Deployment
+	err := scanDeployment(s.db.QueryRowContext(ctx, `
+		SELECT id, name, slug, image, replicas, env, ports, webhook_secret, created_at, updated_at
+		FROM deployments WHERE slug = ?`, slug), &d)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Deployment{}, ErrNotFound
+	}
+	return d, err
+}
+
 // UpdateDeployment updates the mutable desired-state fields. It preserves the
 // existing webhook secret and created_at.
 func (s *Store) UpdateDeployment(ctx context.Context, d Deployment) (Deployment, error) {

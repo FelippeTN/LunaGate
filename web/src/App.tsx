@@ -25,6 +25,7 @@ import {
   createEnvironment,
   deleteDeployment,
   deleteEnvironment,
+  getMetrics,
   getToken,
   listDeployments,
   listEnvironments,
@@ -37,6 +38,7 @@ import {
   type Deployment,
   type Environment,
   type HostContainer,
+  type Metrics,
   type NewDeployment,
 } from "@/api";
 import {
@@ -192,6 +194,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [navOpen, setNavOpen] = useState(false);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [localContainers, setLocalContainers] = useState<HostContainer[]>([]);
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -216,10 +219,15 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   // deployment label, so replica tallies come from this listing rather than
   // one request per deployment.
   const refresh = useCallback(async () => {
-    const [d, c] = await Promise.allSettled([listDeployments(), listHostContainers("local")]);
+    const [d, c, m] = await Promise.allSettled([
+      listDeployments(),
+      listHostContainers("local"),
+      getMetrics(),
+    ]);
     if (d.status === "fulfilled") setDeployments(d.value);
     if (c.status === "fulfilled") setLocalContainers(c.value);
-    const failed = [d, c].find((r) => r.status === "rejected");
+    if (m.status === "fulfilled") setMetrics(m.value);
+    const failed = [d, c, m].find((r) => r.status === "rejected");
     setError(failed ? (failed as PromiseRejectedResult).reason.message : "");
     setLoading(false);
   }, []);
@@ -412,6 +420,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
               running={runningByDeployment}
               environments={environments}
               localContainers={localContainers}
+              metrics={metrics}
               loading={loading}
               refreshKey={overviewRefresh}
             />
@@ -475,6 +484,7 @@ function OverviewPanel({
   running,
   environments,
   localContainers,
+  metrics,
   loading,
   refreshKey,
 }: {
@@ -482,6 +492,7 @@ function OverviewPanel({
   running: Map<string, number>;
   environments: Environment[];
   localContainers: HostContainer[];
+  metrics: Metrics | null;
   loading: boolean;
   refreshKey: number;
 }) {
@@ -533,6 +544,49 @@ function OverviewPanel({
 
   return (
     <div className="grid gap-4 xl:grid-cols-2">
+      <Card className="overflow-hidden xl:col-span-2">
+        <CardHeader>
+          <div>
+            <CardTitle>Running container traffic</CardTitle>
+            <CardDescription>
+              Only requests proxied through /gateway/deployment-slug while a container is running.
+            </CardDescription>
+          </div>
+          {metrics && (
+            <Badge variant="muted" className="tabular">
+              Collector up {formatUptime(metrics.uptime_seconds)}
+            </Badge>
+          )}
+        </CardHeader>
+        <div className="grid grid-cols-2 gap-px border-t border-border bg-border lg:grid-cols-4">
+          {loading || !metrics ? (
+            Array.from({ length: 4 }).map((_, index) => (
+              <div key={index} className="bg-card p-4">
+                <Skeleton className="h-10 w-24" />
+              </div>
+            ))
+          ) : (
+            <>
+              <TrafficStat label="Container requests · 60s" value={String(metrics.requests_last_minute)} />
+              <TrafficStat label="Container requests · total" value={String(metrics.total_requests)} />
+              <TrafficStat label="Container latency · 60s" value={`${metrics.average_latency_ms.toFixed(1)} ms`} />
+              <TrafficStat
+                label="Container errors · 60s"
+                value={`${metrics.last_minute.server_error} (${errorRate(metrics)}%)`}
+                bad={metrics.last_minute.server_error > 0}
+              />
+            </>
+          )}
+        </div>
+        {metrics && (
+          <div className="flex flex-wrap gap-x-5 gap-y-1 border-t border-border px-4 py-3 text-[11px] text-muted-foreground">
+            <span><span className="text-success">2xx/3xx</span> {metrics.last_minute.success}</span>
+            <span><span className="text-warning">4xx</span> {metrics.last_minute.client_error}</span>
+            <span><span className="text-destructive">5xx</span> {metrics.last_minute.server_error}</span>
+          </div>
+        )}
+      </Card>
+
       <Card className="overflow-hidden">
         <CardHeader>
           <div>
@@ -664,6 +718,27 @@ function EmptyOverview({ title, description }: { title: string; description: str
       <p className="mt-1 text-xs text-muted-foreground">{description}</p>
     </div>
   );
+}
+
+function TrafficStat({ label, value, bad = false }: { label: string; value: string; bad?: boolean }) {
+  return (
+    <div className="bg-card p-4">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className={cn("tabular mt-1 text-xl font-semibold", bad && "text-destructive")}>{value}</p>
+    </div>
+  );
+}
+
+function errorRate(metrics: Metrics) {
+  const total = Object.values(metrics.last_minute).reduce((sum, value) => sum + value, 0);
+  return total ? ((metrics.last_minute.server_error / total) * 100).toFixed(1) : "0.0";
+}
+
+function formatUptime(seconds: number) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
 }
 
 type Stat = { label: string; value: string; tone?: "good" | "bad" | "neutral" };

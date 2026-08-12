@@ -71,10 +71,19 @@ Endpoints (all under `/v1`, bearer-authenticated unless noted):
 | `GET` | `/deployments/{id}/containers` | live container status |
 | `GET` | `/deployments/{id}/logs` | SSE log stream (token via header **or** `?token=`) |
 | `POST` | `/webhooks/{id}` | **public**; GitHub `X-Hub-Signature-256` HMAC triggers a redeploy |
+| `GET` | `/metrics` | request volume, latency, status classes, and process uptime |
+| `ANY` | `/gateway/{deployment-slug}/*` | public proxy to a running deployment |
 
 Each deployment gets a `webhook_secret` on creation. Configure a GitHub push
 webhook (JSON content type) pointing at `/v1/webhooks/{id}` with that secret to
 redeploy automatically on CI image pushes.
+
+Request metrics cover only application traffic sent through the gateway while
+the deployment has a running container. The gateway forwards to the first
+published host port and preserves the path after the deployment slug. Requests
+to stopped deployments are rejected and not counted. Counters live in memory
+and restart with the LunaGate process; traffic sent directly to a container's
+host port bypasses the gateway and cannot be observed.
 
 ## Web UI
 

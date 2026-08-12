@@ -47,6 +47,18 @@ export type Environment = {
   created_at?: number;
 };
 
+export type Metrics = {
+  total_requests: number;
+  requests_last_minute: number;
+  average_latency_ms: number;
+  uptime_seconds: number;
+  last_minute: {
+    success: number;
+    client_error: number;
+    server_error: number;
+  };
+};
+
 export type Port = { container: number; host: number };
 
 export type NewDeployment = {
@@ -100,6 +112,8 @@ export const listImages = (env: string) =>
 
 export const listEnvironments = () =>
   req<{ items: Environment[] }>("/environments").then((d) => d.items);
+
+export const getMetrics = () => req<Metrics>("/metrics");
 
 export const createEnvironment = (name: string, sshHost: string, password: string) =>
   req<Environment>("/environments", {

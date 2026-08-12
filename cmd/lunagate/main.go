@@ -58,6 +58,7 @@ func main() {
 	api := httpapi.New(db, dockerClient, envs, token, logger)
 	mux := http.NewServeMux()
 	mux.Handle("/v1/", api)
+	mux.Handle("/gateway/", api)
 	mux.Handle("/healthz", api)
 	mux.Handle("/readyz", api)
 	mux.Handle("/", staticSite(logger))
