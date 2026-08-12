@@ -21,11 +21,12 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
-// containerOps is the slice of the Docker wrapper the HTTP layer needs.
 type containerOps interface {
 	ListByDeployment(ctx context.Context, deploymentID string) ([]docker.Container, error)
 	StopAndRemove(ctx context.Context, id string) error
 	Logs(ctx context.Context, id string, follow bool) (io.ReadCloser, error)
+	ListAllContainers(ctx context.Context) ([]docker.HostContainer, error)
+	ListImages(ctx context.Context) ([]docker.Image, error)
 }
 
 const maxBodySize = 1 << 20
@@ -64,6 +65,9 @@ func New(db *store.Store, dockerOps containerOps, adminToken string, logger *slo
 	mux.Handle("DELETE /v1/deployments/{id}", h.authenticate(http.HandlerFunc(h.deleteDeployment)))
 	mux.Handle("POST /v1/deployments/{id}/redeploy", h.authenticate(http.HandlerFunc(h.redeployDeployment)))
 	mux.Handle("GET /v1/deployments/{id}/containers", h.authenticate(http.HandlerFunc(h.deploymentContainers)))
+
+	mux.Handle("GET /v1/host/containers", h.authenticate(http.HandlerFunc(h.hostContainers)))
+	mux.Handle("GET /v1/host/images", h.authenticate(http.HandlerFunc(h.hostImages)))
 	// Logs use EventSource, which cannot set headers, so this route does its own
 	// token check (header or ?token=) instead of the authenticate middleware.
 	mux.HandleFunc("GET /v1/deployments/{id}/logs", h.deploymentLogs)
@@ -284,6 +288,24 @@ func (h *handler) deploymentContainers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": containers})
 }
 
+func (h *handler) hostContainers(w http.ResponseWriter, r *http.Request) {
+	containers, err := h.docker.ListAllContainers(r.Context())
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": containers})
+}
+
+func (h *handler) hostImages(w http.ResponseWriter, r *http.Request) {
+	images, err := h.docker.ListImages(r.Context())
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": images})
+}
+
 func (h *handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if token == "" {
@@ -361,7 +383,6 @@ func (h *handler) webhook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "redeploying"})
 }
 
-// reap stops and removes every container LunaGate owns for a deployment.
 func (h *handler) reap(ctx context.Context, deploymentID string) {
 	containers, err := h.docker.ListByDeployment(ctx, deploymentID)
 	if err != nil {

@@ -27,6 +27,10 @@ func (stubDocker) StopAndRemove(context.Context, string) error { return nil }
 func (stubDocker) Logs(context.Context, string, bool) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
+func (stubDocker) ListAllContainers(context.Context) ([]docker.HostContainer, error) {
+	return nil, nil
+}
+func (stubDocker) ListImages(context.Context) ([]docker.Image, error) { return nil, nil }
 
 func TestAPILifecycle(t *testing.T) {
 	db, err := store.Open(":memory:")

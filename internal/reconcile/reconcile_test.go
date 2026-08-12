@@ -11,7 +11,6 @@ import (
 	"github.com/FelippeTN/LunaGate/internal/store"
 )
 
-// fakeRuntime is an in-memory stand-in for the Docker wrapper.
 type fakeRuntime struct {
 	containers []docker.Container
 	nextID     int

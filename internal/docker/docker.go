@@ -14,7 +14,6 @@ import (
 	"github.com/docker/go-connections/nat"
 )
 
-// Ownership labels. Every container LunaGate starts carries these.
 const (
 	labelManaged    = "lunagate.managed"
 	labelDeployment = "lunagate.deployment"
@@ -24,13 +23,11 @@ const (
 
 type Client struct{ cli *client.Client }
 
-// Port maps a container port to a host port.
 type Port struct {
 	Container int `json:"container"`
 	Host      int `json:"host"`
 }
 
-// Spec is everything needed to start one replica of a deployment.
 type Spec struct {
 	DeploymentID string
 	Replica      int
@@ -39,11 +36,31 @@ type Spec struct {
 	Ports        []Port
 }
 
-// Container is the subset of a running container LunaGate reports on.
 type Container struct {
 	ID    string `json:"id"`
 	State string `json:"state"`
 	Image string `json:"image"`
+}
+
+type HostContainer struct {
+	ID      string   `json:"id"`
+	Names   []string `json:"names"`
+	Image   string   `json:"image"`
+	State   string   `json:"state"`
+	Status  string   `json:"status"`
+	Ports   []string `json:"ports"`
+	Created int64    `json:"created"`
+	Managed bool     `json:"managed"`
+	// Deployment lets a caller tally replicas per deployment from this one
+	// listing instead of one request per deployment.
+	Deployment string `json:"deployment,omitempty"`
+}
+
+type Image struct {
+	ID       string   `json:"id"`
+	RepoTags []string `json:"repo_tags"`
+	Size     int64    `json:"size"`
+	Created  int64    `json:"created"`
 }
 
 func New() (*Client, error) {
@@ -61,7 +78,8 @@ func (c *Client) Ping(ctx context.Context) error {
 	return err
 }
 
-// PullImage pulls the image and drains the progress stream to completion.
+// PullImage drains the progress stream to completion; the API requires it
+// read even when the progress itself is unused.
 func (c *Client) PullImage(ctx context.Context, ref string) error {
 	// ponytail: no registry auth yet; add image.PullOptions.RegistryAuth when
 	//           private registries are needed (roadmap item 6).
@@ -74,7 +92,6 @@ func (c *Client) PullImage(ctx context.Context, ref string) error {
 	return err
 }
 
-// RunContainer creates and starts one replica from spec.
 func (c *Client) RunContainer(ctx context.Context, spec Spec) (string, error) {
 	env := make([]string, 0, len(spec.Env))
 	for k, v := range spec.Env {
@@ -124,7 +141,6 @@ func (c *Client) StopAndRemove(ctx context.Context, id string) error {
 	return c.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
 }
 
-// ListByDeployment returns all containers LunaGate owns for a deployment.
 func (c *Client) ListByDeployment(ctx context.Context, deploymentID string) ([]Container, error) {
 	args := filters.NewArgs(
 		filters.Arg("label", labelManaged+"=true"),
@@ -140,6 +156,59 @@ func (c *Client) ListByDeployment(ctx context.Context, deploymentID string) ([]C
 			ID:    item.ID,
 			State: item.State,
 			Image: item.Labels[labelImage],
+		})
+	}
+	return out, nil
+}
+
+// ListAllContainers is read-only: it never mutates a container LunaGate
+// doesn't own.
+func (c *Client) ListAllContainers(ctx context.Context) ([]HostContainer, error) {
+	list, err := c.cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]HostContainer, 0, len(list))
+	for _, item := range list {
+		ports := make([]string, 0, len(item.Ports))
+		for _, p := range item.Ports {
+			if p.PublicPort == 0 {
+				ports = append(ports, strconv.Itoa(int(p.PrivatePort))+"/"+p.Type)
+				continue
+			}
+			ports = append(ports, strconv.Itoa(int(p.PublicPort))+":"+strconv.Itoa(int(p.PrivatePort))+"/"+p.Type)
+		}
+		out = append(out, HostContainer{
+			ID:         item.ID,
+			Names:      item.Names,
+			Image:      item.Image,
+			State:      item.State,
+			Status:     item.Status,
+			Ports:      ports,
+			Created:    item.Created,
+			Managed:    item.Labels[labelManaged] == "true",
+			Deployment: item.Labels[labelDeployment],
+		})
+	}
+	return out, nil
+}
+
+func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
+	list, err := c.cli.ImageList(ctx, image.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Image, 0, len(list))
+	for _, item := range list {
+		tags := item.RepoTags
+		if tags == nil {
+			tags = []string{}
+		}
+		out = append(out, Image{
+			ID:       item.ID,
+			RepoTags: tags,
+			Size:     item.Size,
+			Created:  item.Created,
 		})
 	}
 	return out, nil

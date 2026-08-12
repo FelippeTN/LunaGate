@@ -20,6 +20,25 @@ export type Deployment = {
 
 export type Container = { id: string; state: string; image: string };
 
+export type HostContainer = {
+  id: string;
+  names: string[];
+  image: string;
+  state: string;
+  status: string;
+  ports: string[];
+  created: number;
+  managed: boolean;
+  deployment?: string;
+};
+
+export type Image = {
+  id: string;
+  repo_tags: string[];
+  size: number;
+  created: number;
+};
+
 export type Port = { container: number; host: number };
 
 export type NewDeployment = {
@@ -62,6 +81,12 @@ export const redeploy = (id: string) =>
 
 export const listContainers = (id: string) =>
   req<{ items: Container[] }>(`/deployments/${id}/containers`).then((d) => d.items);
+
+export const listHostContainers = () =>
+  req<{ items: HostContainer[] }>("/host/containers").then((d) => d.items);
+
+export const listImages = () =>
+  req<{ items: Image[] }>("/host/images").then((d) => d.items);
 
 // EventSource can't send headers, so the token rides as a query param.
 export const logsURL = (id: string) =>

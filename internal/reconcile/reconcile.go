@@ -12,8 +12,6 @@ import (
 	"github.com/FelippeTN/LunaGate/internal/store"
 )
 
-// Runtime is the slice of the Docker wrapper the reconciler needs. Kept small
-// so tests can fake it.
 type Runtime interface {
 	PullImage(ctx context.Context, ref string) error
 	RunContainer(ctx context.Context, spec docker.Spec) (string, error)
@@ -21,7 +19,6 @@ type Runtime interface {
 	ListByDeployment(ctx context.Context, deploymentID string) ([]docker.Container, error)
 }
 
-// Lister supplies the desired state.
 type Lister interface {
 	ListDeployments(ctx context.Context) ([]store.Deployment, error)
 }
@@ -52,8 +49,6 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 }
 
-// Tick reconciles every deployment once.
-//
 // ponytail: global reconcile in a single tick, no per-deployment worker.
 //           Recreates all replicas at once on a redeploy (brief downtime);
 //           upgrade to rolling one-at-a-time for zero-downtime (roadmap item 2).
@@ -117,7 +112,6 @@ func (r *Reconciler) reconcileOne(ctx context.Context, d store.Deployment) error
 	return nil
 }
 
-// specFor builds a container spec from a deployment's stored JSON fields.
 func specFor(d store.Deployment) (docker.Spec, error) {
 	spec := docker.Spec{DeploymentID: d.ID, Image: d.Image}
 	if d.Env != "" {
