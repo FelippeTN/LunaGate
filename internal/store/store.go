@@ -53,6 +53,24 @@ type Environment struct {
 	CreatedAt   int64  `json:"created_at"`
 }
 
+type ContainerTracking struct {
+	EnvironmentID string `json:"environment_id"`
+	ContainerID   string `json:"container_id"`
+	ContainerName string `json:"container_name"`
+	StartedAt     int64  `json:"started_at"`
+	EndsAt        int64  `json:"ends_at"`
+	Active        bool   `json:"active"`
+}
+
+type ContainerMetrics struct {
+	Tracking         *ContainerTracking `json:"tracking"`
+	RequestsTotal    uint64             `json:"requests_total"`
+	RequestsLastHour uint64             `json:"requests_last_hour"`
+	AverageLatencyMS float64            `json:"average_latency_ms"`
+	RequestsPerHour  []uint64           `json:"requests_per_hour"`
+	Status           [3]uint64          `json:"-"`
+}
+
 type Store struct{ db *sql.DB }
 
 func Open(path string) (*Store, error) {
@@ -94,6 +112,24 @@ func Open(path string) (*Store, error) {
 			ssh_host TEXT NOT NULL,
 			ssh_password TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS container_tracking (
+			singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+			environment_id TEXT NOT NULL,
+			container_id TEXT NOT NULL,
+			container_name TEXT NOT NULL,
+			started_at INTEGER NOT NULL,
+			ends_at INTEGER NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS container_request_hours (
+			tracking_started_at INTEGER NOT NULL,
+			bucket INTEGER NOT NULL,
+			requests INTEGER NOT NULL DEFAULT 0,
+			latency_us INTEGER NOT NULL DEFAULT 0,
+			success INTEGER NOT NULL DEFAULT 0,
+			client_error INTEGER NOT NULL DEFAULT 0,
+			server_error INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (tracking_started_at, bucket)
 		);`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize schema: %w", err)
@@ -348,6 +384,102 @@ func (s *Store) DeleteEnvironment(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) StartContainerTracking(ctx context.Context, environmentID, containerID, containerName string, now time.Time) (ContainerMetrics, error) {
+	startedAt := now.UTC().Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ContainerMetrics{}, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM container_request_hours`); err != nil {
+		return ContainerMetrics{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `
+		INSERT INTO container_tracking (singleton, environment_id, container_id, container_name, started_at, ends_at)
+		VALUES (1, ?, ?, ?, ?, ?)
+		ON CONFLICT(singleton) DO UPDATE SET environment_id=excluded.environment_id,
+		container_id=excluded.container_id, container_name=excluded.container_name,
+		started_at=excluded.started_at, ends_at=excluded.ends_at`,
+		environmentID, containerID, containerName, startedAt, startedAt+7*24*60*60); err != nil {
+		return ContainerMetrics{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return ContainerMetrics{}, err
+	}
+	return s.ContainerMetrics(ctx, now)
+}
+
+func (s *Store) RecordContainerRequest(ctx context.Context, environmentID, containerID string, now time.Time, statusClass int, latency time.Duration) error {
+	status := [3]int{}
+	status[statusClass] = 1
+	unix := now.UTC().Unix()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO container_request_hours
+			(tracking_started_at, bucket, requests, latency_us, success, client_error, server_error)
+		SELECT started_at, CAST((? - started_at) / 3600 AS INTEGER), 1, ?, ?, ?, ?
+		FROM container_tracking
+		WHERE singleton = 1 AND environment_id = ? AND container_id = ? AND ? >= started_at AND ? < ends_at
+		ON CONFLICT(tracking_started_at, bucket) DO UPDATE SET
+			requests=requests+1, latency_us=latency_us+excluded.latency_us,
+			success=success+excluded.success, client_error=client_error+excluded.client_error,
+			server_error=server_error+excluded.server_error`,
+		unix, latency.Microseconds(), status[0], status[1], status[2], environmentID, containerID, unix, unix)
+	return err
+}
+
+func (s *Store) ContainerMetrics(ctx context.Context, now time.Time) (ContainerMetrics, error) {
+	metrics := ContainerMetrics{RequestsPerHour: make([]uint64, 7*24)}
+	var tracking ContainerTracking
+	err := s.db.QueryRowContext(ctx, `
+		SELECT environment_id, container_id, container_name, started_at, ends_at
+		FROM container_tracking WHERE singleton = 1`).Scan(
+		&tracking.EnvironmentID, &tracking.ContainerID, &tracking.ContainerName, &tracking.StartedAt, &tracking.EndsAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return metrics, nil
+	}
+	if err != nil {
+		return ContainerMetrics{}, err
+	}
+	tracking.Active = now.UTC().Unix() >= tracking.StartedAt && now.UTC().Unix() < tracking.EndsAt
+	metrics.Tracking = &tracking
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT bucket, requests, latency_us, success, client_error, server_error
+		FROM container_request_hours WHERE tracking_started_at = ? ORDER BY bucket`, tracking.StartedAt)
+	if err != nil {
+		return ContainerMetrics{}, err
+	}
+	defer rows.Close()
+	var latencyUS uint64
+	currentBucket := (now.UTC().Unix() - tracking.StartedAt) / 3600
+	for rows.Next() {
+		var bucket int
+		var requests, bucketLatency uint64
+		var status [3]uint64
+		if err := rows.Scan(&bucket, &requests, &bucketLatency, &status[0], &status[1], &status[2]); err != nil {
+			return ContainerMetrics{}, err
+		}
+		if bucket >= 0 && bucket < len(metrics.RequestsPerHour) {
+			metrics.RequestsPerHour[bucket] = requests
+		}
+		metrics.RequestsTotal += requests
+		latencyUS += bucketLatency
+		for i := range status {
+			metrics.Status[i] += status[i]
+		}
+		if int64(bucket) == currentBucket {
+			metrics.RequestsLastHour = requests
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return ContainerMetrics{}, err
+	}
+	if metrics.RequestsTotal > 0 {
+		metrics.AverageLatencyMS = float64(latencyUS) / 1000 / float64(metrics.RequestsTotal)
+	}
+	return metrics, nil
 }
 
 func scanDeployment(row scanner, d *Deployment) error {

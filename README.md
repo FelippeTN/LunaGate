@@ -71,25 +71,24 @@ Endpoints (all under `/v1`, bearer-authenticated unless noted):
 | `GET` | `/deployments/{id}/containers` | live container status |
 | `GET` | `/deployments/{id}/logs` | SSE log stream (token via header **or** `?token=`) |
 | `POST` | `/webhooks/{id}` | **public**; GitHub `X-Hub-Signature-256` HMAC triggers a redeploy |
-| `GET` | `/container-metrics` | gateway request volume, latency, and container response classes |
+| `GET/POST` | `/container-metrics` | read or start a seven-day request tracker for one container |
 | `POST` | `/host/containers/{id}/start|stop|restart?env={id}` | control a local or SSH container |
 | `DELETE` | `/host/containers/{id}?env={id}` | remove a stopped local or SSH container |
 | `GET` | `/host/containers/{id}/logs?env={id}` | stream local or SSH container logs over SSE |
 | `ANY` | `/gateway/{deployment-slug}/*` | public proxy to a running deployment |
+| `ANY` | `/gateway/local/{container-id}/*` | public proxy to a running local container |
 | `ANY` | `/gateway/ssh/{environment-id}/{container-id}/*` | public SSH tunnel to a running remote container |
 
 Each deployment gets a `webhook_secret` on creation. Configure a GitHub push
 webhook (JSON content type) pointing at `/v1/webhooks/{id}` with that secret to
 redeploy automatically on CI image pushes.
 
-Request metrics cover only application traffic sent through the gateway while
-the deployment has a running container. The gateway forwards to the first
-published TCP host port and preserves the remaining path. SSH containers use
-the **Open** link in the Host containers panel; their traffic is tunneled over
-the configured SSH connection. Requests to stopped or unreachable containers
-are rejected and not counted. Counters live in memory and restart with the
-LunaGate process; traffic sent directly to a container's host port bypasses the
-gateway and cannot be observed.
+Request tracking covers only application traffic sent through the selected
+container's gateway URL during its seven-day window. The Overview panel shows
+that URL and has a Copy button; use it as the public base URL for the tracked
+application. Requests sent directly to a container's host port or over the
+Compose network bypass LunaGate and cannot be observed. The selected container,
+hourly buckets, latency, and response classes persist in SQLite across restarts.
 
 ## Web UI
 

@@ -23,7 +23,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/FelippeTN/LunaGate/internal/docker"
@@ -47,20 +46,6 @@ type handler struct {
 	envs      environmentManager
 	adminHash [32]byte
 	logger    *slog.Logger
-	metrics   requestMetrics
-}
-
-type metricBucket struct {
-	second   int64
-	requests uint64
-	latency  time.Duration
-	status   [3]uint64
-}
-
-type requestMetrics struct {
-	mu      sync.Mutex
-	total   uint64
-	buckets [60]metricBucket
 }
 
 type apiInput struct {
@@ -79,6 +64,8 @@ func New(db *store.Store, dockerOps docker.ContainerOps, envs environmentManager
 	mux.HandleFunc("GET /readyz", h.ready)
 	mux.HandleFunc("/gateway/{slug}", h.gateway)
 	mux.HandleFunc("/gateway/{slug}/{path...}", h.gateway)
+	mux.HandleFunc("/gateway/local/{container}", h.localContainerGateway)
+	mux.HandleFunc("/gateway/local/{container}/{path...}", h.localContainerGateway)
 	mux.HandleFunc("/gateway/ssh/{environment}/{container}", h.sshGateway)
 	mux.HandleFunc("/gateway/ssh/{environment}/{container}/{path...}", h.sshGateway)
 	mux.Handle("GET /v1/apis", h.authenticate(http.HandlerFunc(h.listAPIs)))
@@ -110,6 +97,7 @@ func New(db *store.Store, dockerOps docker.ContainerOps, envs environmentManager
 	mux.Handle("DELETE /v1/host/networks/{id}", h.authenticate(http.HandlerFunc(h.removeHostNetwork)))
 	mux.HandleFunc("GET /v1/host/containers/{id}/logs", h.hostContainerLogs)
 	mux.Handle("GET /v1/container-metrics", h.authenticate(http.HandlerFunc(h.getContainerMetrics)))
+	mux.Handle("POST /v1/container-metrics", h.authenticate(http.HandlerFunc(h.startContainerTracking)))
 
 	mux.Handle("GET /v1/environments", h.authenticate(http.HandlerFunc(h.listEnvironments)))
 	mux.Handle("POST /v1/environments", h.authenticate(http.HandlerFunc(h.createEnvironment)))
@@ -491,8 +479,92 @@ func (h *handler) containerAction(w http.ResponseWriter, r *http.Request, action
 	writeJSON(w, http.StatusOK, map[string]string{"status": action})
 }
 
-func (h *handler) getContainerMetrics(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.metrics.snapshot(time.Now()))
+func (h *handler) getContainerMetrics(w http.ResponseWriter, r *http.Request) {
+	metrics, err := h.store.ContainerMetrics(r.Context(), time.Now())
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	h.writeContainerMetrics(w, metrics)
+}
+
+func (h *handler) startContainerTracking(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input struct {
+		EnvironmentID string `json:"environment_id"`
+		ContainerID   string `json:"container_id"`
+	}
+	if err := decoder.Decode(&input); err != nil || input.EnvironmentID == "" || input.ContainerID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_tracking", "environment_id and container_id are required")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_tracking", "request body must contain one JSON object")
+		return
+	}
+	if len(input.EnvironmentID) > 128 || len(input.ContainerID) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_tracking", "container selection is too long")
+		return
+	}
+
+	ops, err := h.containerOps(r.Context(), input.EnvironmentID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "environment not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	containers, err := ops.ListAllContainers(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	var selected *docker.HostContainer
+	for i := range containers {
+		if containers[i].ID == input.ContainerID {
+			selected = &containers[i]
+			break
+		}
+	}
+	if selected == nil {
+		writeError(w, http.StatusNotFound, "not_found", "container not found")
+		return
+	}
+	if selected.State != "running" {
+		writeError(w, http.StatusConflict, "container_unavailable", "container is not running")
+		return
+	}
+	if _, ok := firstPublishedTCPPort(selected.Ports); !ok {
+		writeError(w, http.StatusConflict, "port_unavailable", "container has no published TCP port")
+		return
+	}
+	name := selected.ID[:min(12, len(selected.ID))]
+	if len(selected.Names) > 0 {
+		name = strings.TrimPrefix(selected.Names[0], "/")
+	}
+	metrics, err := h.store.StartContainerTracking(r.Context(), input.EnvironmentID, selected.ID, name, time.Now())
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	h.writeContainerMetrics(w, metrics)
+}
+
+func (h *handler) writeContainerMetrics(w http.ResponseWriter, metrics store.ContainerMetrics) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tracking":           metrics.Tracking,
+		"requests_total":     metrics.RequestsTotal,
+		"requests_last_hour": metrics.RequestsLastHour,
+		"average_latency_ms": metrics.AverageLatencyMS,
+		"requests_per_hour":  metrics.RequestsPerHour,
+		"status": map[string]uint64{
+			"success": metrics.Status[0], "client_error": metrics.Status[1], "server_error": metrics.Status[2],
+		},
+	})
 }
 
 func (h *handler) gateway(w http.ResponseWriter, r *http.Request) {
@@ -510,14 +582,14 @@ func (h *handler) gateway(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "docker_unavailable", "could not check container state")
 		return
 	}
-	running := false
+	runningContainer := ""
 	for _, container := range containers {
 		if container.State == "running" {
-			running = true
+			runningContainer = container.ID
 			break
 		}
 	}
-	if !running {
+	if runningContainer == "" {
 		writeError(w, http.StatusServiceUnavailable, "deployment_unavailable", "deployment has no running containers")
 		return
 	}
@@ -531,9 +603,40 @@ func (h *handler) gateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.proxyContainer(w, r, d.ID, &url.URL{
+	h.proxyContainer(w, r, "local", runningContainer, &url.URL{
 		Scheme: "http",
 		Host:   fmt.Sprintf("127.0.0.1:%d", ports[0].Host),
+	}, nil)
+}
+
+func (h *handler) localContainerGateway(w http.ResponseWriter, r *http.Request) {
+	containers, err := h.docker.ListAllContainers(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "docker_unavailable", "could not check container state")
+		return
+	}
+	var container *docker.HostContainer
+	for i := range containers {
+		if containers[i].ID == r.PathValue("container") {
+			container = &containers[i]
+			break
+		}
+	}
+	if container == nil {
+		writeError(w, http.StatusNotFound, "not_found", "container not found")
+		return
+	}
+	if container.State != "running" {
+		writeError(w, http.StatusServiceUnavailable, "container_unavailable", "container is not running")
+		return
+	}
+	port, ok := firstPublishedTCPPort(container.Ports)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "port_unavailable", "container has no published TCP port")
+		return
+	}
+	h.proxyContainer(w, r, "local", container.ID, &url.URL{
+		Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
 	}, nil)
 }
 
@@ -591,7 +694,7 @@ func (h *handler) sshGateway(w http.ResponseWriter, r *http.Request) {
 		return h.envs.DialContext(ctx, env.SSHHost, password, target)
 	}}
 	defer transport.CloseIdleConnections()
-	h.proxyContainer(w, r, container.ID, &url.URL{Scheme: "http", Host: "remote-container"}, transport)
+	h.proxyContainer(w, r, env.ID, container.ID, &url.URL{Scheme: "http", Host: "remote-container"}, transport)
 }
 
 func firstPublishedTCPPort(ports []string) (int, bool) {
@@ -608,7 +711,7 @@ func firstPublishedTCPPort(ports []string) (int, bool) {
 	return 0, false
 }
 
-func (h *handler) proxyContainer(w http.ResponseWriter, r *http.Request, container string, target *url.URL, transport http.RoundTripper) {
+func (h *handler) proxyContainer(w http.ResponseWriter, r *http.Request, environment, container string, target *url.URL, transport http.RoundTripper) {
 	originalPath, originalRawPath := r.URL.Path, r.URL.RawPath
 	r.URL.Path = "/" + r.PathValue("path")
 	r.URL.RawPath = ""
@@ -627,8 +730,28 @@ func (h *handler) proxyContainer(w http.ResponseWriter, r *http.Request, contain
 	proxy.ServeHTTP(response, r)
 	r.URL.Path, r.URL.RawPath = originalPath, originalRawPath
 	if !proxyFailed {
-		h.metrics.record(time.Now(), response.status, time.Since(started))
+		if err := h.store.RecordContainerRequest(r.Context(), environment, container, time.Now(), statusClass(response.status), time.Since(started)); err != nil {
+			h.logger.Error("record container request", "container", container, "error", err)
+		}
 	}
+}
+
+func (h *handler) containerOps(ctx context.Context, environmentID string) (docker.ContainerOps, error) {
+	if environmentID == "local" {
+		return h.docker, nil
+	}
+	env, err := h.store.GetEnvironment(ctx, environmentID)
+	if err != nil {
+		return nil, err
+	}
+	if h.envs == nil {
+		return nil, errors.New("remote environments are unavailable")
+	}
+	password, err := h.openCredential(env.SSHPassword)
+	if err != nil {
+		return nil, err
+	}
+	return h.envs.Remote(env.SSHHost, password)
 }
 
 // resolveEnv picks the container operations for ?env=<id>, defaulting to "local".
@@ -1051,54 +1174,6 @@ func (w *statusWriter) Flush() {
 
 func (w *statusWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
-}
-
-func (m *requestMetrics) record(now time.Time, status int, latency time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	class := statusClass(status)
-	m.total++
-	second := now.Unix()
-	bucket := &m.buckets[second%int64(len(m.buckets))]
-	if bucket.second != second {
-		*bucket = metricBucket{second: second}
-	}
-	bucket.requests++
-	bucket.latency += latency
-	bucket.status[class]++
-}
-
-func (m *requestMetrics) snapshot(now time.Time) map[string]any {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var requests uint64
-	var latency time.Duration
-	var statuses [3]uint64
-	cutoff := now.Unix() - 59
-	for _, bucket := range m.buckets {
-		if bucket.second < cutoff {
-			continue
-		}
-		requests += bucket.requests
-		latency += bucket.latency
-		for i := range statuses {
-			statuses[i] += bucket.status[i]
-		}
-	}
-	averageLatency := float64(0)
-	if requests > 0 {
-		averageLatency = float64(latency.Microseconds()) / 1000 / float64(requests)
-	}
-	return map[string]any{
-		"container_requests_total":       m.total,
-		"container_requests_last_minute": requests,
-		"container_average_latency_ms":   averageLatency,
-		"last_minute": map[string]uint64{
-			"success": statuses[0], "client_error": statuses[1], "server_error": statuses[2],
-		},
-	}
 }
 
 func statusClass(status int) int {

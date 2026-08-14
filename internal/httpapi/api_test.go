@@ -183,7 +183,7 @@ func TestOnlyRunningContainerRequestsAreCounted(t *testing.T) {
 	defer db.Close()
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.RequestURI() != "/hello?x=1" && r.URL.RequestURI() != "/remote?x=2" {
+		if r.URL.RequestURI() != "/hello?x=1" && r.URL.RequestURI() != "/remote?x=2" && r.URL.RequestURI() != "/remote?x=3" {
 			t.Errorf("upstream request URI = %q", r.URL.RequestURI())
 		}
 		writeJSON := json.NewEncoder(w)
@@ -208,7 +208,12 @@ func TestOnlyRunningContainerRequestsAreCounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dockerOps := &gatewayDocker{containers: []docker.Container{{ID: "running", State: "running"}}}
+	dockerOps := &gatewayDocker{
+		containers: []docker.Container{{ID: "running", State: "running"}},
+		hostContainers: []docker.HostContainer{{
+			ID: "running", Names: []string{"/local-running"}, State: "running", Ports: []string{fmt.Sprintf("%d:80/tcp", port)},
+		}},
+	}
 	remoteOps := &gatewayDocker{hostContainers: []docker.HostContainer{{
 		ID: "remote-running", State: "running", Ports: []string{fmt.Sprintf("%d:80/tcp", port)},
 	}}}
@@ -243,20 +248,55 @@ func TestOnlyRunningContainerRequestsAreCounted(t *testing.T) {
 	request("/v1/deployments", false)
 	request("/gateway/missing/hello", false)
 	_, metrics := request("/v1/container-metrics", true)
-	if metrics["container_requests_total"] != float64(0) || metrics["container_requests_last_minute"] != float64(0) {
+	if metrics["tracking"] != nil || metrics["requests_total"] != float64(0) {
 		t.Fatalf("LunaGate requests were counted: %#v", metrics)
 	}
+	selectContainer := func(environment, container string) map[string]any {
+		t.Helper()
+		body := strings.NewReader(fmt.Sprintf(`{"environment_id":%q,"container_id":%q}`, environment, container))
+		req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/container-metrics", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer secret")
+		req.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("select container status = %d", response.StatusCode)
+		}
+		var selected map[string]any
+		if err := json.NewDecoder(response.Body).Decode(&selected); err != nil {
+			t.Fatal(err)
+		}
+		return selected
+	}
+	metrics = selectContainer("local", "running")
+	if metrics["tracking"].(map[string]any)["container_name"] != "local-running" {
+		t.Fatalf("unexpected tracking selection: %#v", metrics)
+	}
 
-	response, body := request("/gateway/app/hello?x=1", false)
+	response, body := request("/gateway/local/running/hello?x=1", false)
 	if response.StatusCode != http.StatusCreated || body["ok"] != true {
 		t.Fatalf("gateway status = %d, body = %#v", response.StatusCode, body)
 	}
 	_, metrics = request("/v1/container-metrics", true)
 
-	if metrics["container_requests_total"] != float64(1) || metrics["container_requests_last_minute"] != float64(1) {
+	if metrics["requests_total"] != float64(1) || metrics["requests_last_hour"] != float64(1) {
 		t.Fatalf("unexpected request counts: %#v", metrics)
 	}
-	statuses := metrics["last_minute"].(map[string]any)
+	history := metrics["requests_per_hour"].([]any)
+	var historyTotal float64
+	for _, requests := range history {
+		historyTotal += requests.(float64)
+	}
+	if len(history) != 7*24 || historyTotal != float64(1) {
+		t.Fatalf("unexpected request history: %#v", history)
+	}
+	statuses := metrics["status"].(map[string]any)
 	if statuses["success"] != float64(1) || statuses["client_error"] != float64(0) || statuses["server_error"] != float64(0) {
 		t.Fatalf("unexpected status counts: %#v", statuses)
 	}
@@ -265,8 +305,17 @@ func TestOnlyRunningContainerRequestsAreCounted(t *testing.T) {
 		t.Fatalf("SSH gateway status = %d, body = %#v", response.StatusCode, body)
 	}
 	_, metrics = request("/v1/container-metrics", true)
-	if metrics["container_requests_total"] != float64(2) {
-		t.Fatalf("remote container request was not counted: %#v", metrics)
+	if metrics["requests_total"] != float64(1) {
+		t.Fatalf("unselected remote container was counted: %#v", metrics)
+	}
+	selectContainer(environment.ID, "remote-running")
+	response, body = request("/gateway/ssh/"+environment.ID+"/remote-running/remote?x=3", false)
+	if response.StatusCode != http.StatusCreated || body["ok"] != true {
+		t.Fatalf("selected SSH gateway status = %d, body = %#v", response.StatusCode, body)
+	}
+	_, metrics = request("/v1/container-metrics", true)
+	if metrics["requests_total"] != float64(1) {
+		t.Fatalf("selected remote container was not counted: %#v", metrics)
 	}
 
 	remoteOps.hostContainers[0].State = "exited"
@@ -281,7 +330,7 @@ func TestOnlyRunningContainerRequestsAreCounted(t *testing.T) {
 		t.Fatalf("unreachable container status = %d", response.StatusCode)
 	}
 	_, metrics = request("/v1/container-metrics", true)
-	if metrics["container_requests_total"] != float64(2) {
+	if metrics["requests_total"] != float64(1) {
 		t.Fatalf("request rejected by the container was counted: %#v", metrics)
 	}
 
@@ -291,7 +340,7 @@ func TestOnlyRunningContainerRequestsAreCounted(t *testing.T) {
 		t.Fatalf("stopped deployment status = %d", response.StatusCode)
 	}
 	_, metrics = request("/v1/container-metrics", true)
-	if metrics["container_requests_total"] != float64(2) {
+	if metrics["requests_total"] != float64(1) {
 		t.Fatalf("stopped deployment was counted: %#v", metrics)
 	}
 }

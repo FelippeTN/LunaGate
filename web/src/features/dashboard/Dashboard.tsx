@@ -295,6 +295,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         </header>
 
         <main className="space-y-4 p-4 sm:p-6">
+          {tab === "overview" && (
           <SummaryBar
             loading={loading}
             stats={[
@@ -325,6 +326,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
               { label: "Servers", value: String(environments.length) },
             ]}
           />
+          )}
 
           {error && (
             <Card className="border-destructive/50 bg-destructive/5 p-3 text-sm text-destructive">
@@ -339,6 +341,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
               environments={environments}
               localContainers={localContainers}
               metrics={metrics}
+              onMetricsChange={setMetrics}
               loading={loading}
               refreshKey={overviewRefresh}
             />
@@ -396,4 +399,3 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     </div>
   );
 }
-

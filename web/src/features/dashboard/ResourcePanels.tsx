@@ -283,10 +283,10 @@ export function HostContainersPanel({ envId }: { envId: string }) {
                 )}
               </TableCell>
               <TableCell className="text-xs">
-                {envId !== "local" && c.state === "running" && hasPublishedTCPPort(c) ? (
+                {c.state === "running" && hasPublishedTCPPort(c) ? (
                   <a
                     className="font-medium text-primary hover:underline"
-                    href={sshGatewayURL(envId, c.id)}
+                    href={containerGatewayURL(envId, c.id)}
                     target="_blank"
                     rel="noreferrer"
                   >
@@ -774,8 +774,10 @@ function sortContainers(containers: HostContainer[]) {
   );
 }
 
-function sshGatewayURL(environment: string, container: string) {
-  return `/gateway/ssh/${encodeURIComponent(environment)}/${encodeURIComponent(container)}/`;
+function containerGatewayURL(environment: string, container: string) {
+  return environment === "local"
+    ? `/gateway/local/${encodeURIComponent(container)}/`
+    : `/gateway/ssh/${encodeURIComponent(environment)}/${encodeURIComponent(container)}/`;
 }
 
 function timeAgo(unixSeconds: number) {
@@ -786,4 +788,3 @@ function timeAgo(unixSeconds: number) {
   if (days < 365) return `${Math.floor(days / 30)}mo ago`;
   return `${Math.floor(days / 365)}y ago`;
 }
-

@@ -71,10 +71,19 @@ export type Environment = {
 };
 
 export type ContainerMetrics = {
-  container_requests_total: number;
-  container_requests_last_minute: number;
-  container_average_latency_ms: number;
-  last_minute: {
+  tracking: null | {
+    environment_id: string;
+    container_id: string;
+    container_name: string;
+    started_at: number;
+    ends_at: number;
+    active: boolean;
+  };
+  requests_total: number;
+  requests_last_hour: number;
+  average_latency_ms: number;
+  requests_per_hour: number[];
+  status: {
     success: number;
     client_error: number;
     server_error: number;
@@ -176,6 +185,12 @@ export const listEnvironments = () =>
   req<{ items: Environment[] }>("/environments").then((d) => d.items);
 
 export const getContainerMetrics = () => req<ContainerMetrics>("/container-metrics");
+
+export const startContainerTracking = (environmentId: string, containerId: string) =>
+  req<ContainerMetrics>("/container-metrics", {
+    method: "POST",
+    body: JSON.stringify({ environment_id: environmentId, container_id: containerId }),
+  });
 
 export const createEnvironment = (name: string, sshHost: string, password: string) =>
   req<Environment>("/environments", {
