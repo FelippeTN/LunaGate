@@ -101,7 +101,13 @@ func New(db *store.Store, dockerOps docker.ContainerOps, envs environmentManager
 	mux.Handle("POST /v1/host/containers/{id}/stop", h.authenticate(http.HandlerFunc(h.stopHostContainer)))
 	mux.Handle("POST /v1/host/containers/{id}/restart", h.authenticate(http.HandlerFunc(h.restartHostContainer)))
 	mux.Handle("DELETE /v1/host/containers/{id}", h.authenticate(http.HandlerFunc(h.removeHostContainer)))
+	mux.Handle("GET /v1/host/containers/stats", h.authenticate(http.HandlerFunc(h.hostContainerStats)))
 	mux.Handle("DELETE /v1/host/images/{id}", h.authenticate(http.HandlerFunc(h.removeHostImage)))
+	mux.Handle("POST /v1/host/images/prune", h.authenticate(http.HandlerFunc(h.pruneHostImages)))
+	mux.Handle("GET /v1/host/volumes", h.authenticate(http.HandlerFunc(h.hostVolumes)))
+	mux.Handle("DELETE /v1/host/volumes/{name}", h.authenticate(http.HandlerFunc(h.removeHostVolume)))
+	mux.Handle("GET /v1/host/networks", h.authenticate(http.HandlerFunc(h.hostNetworks)))
+	mux.Handle("DELETE /v1/host/networks/{id}", h.authenticate(http.HandlerFunc(h.removeHostNetwork)))
 	mux.HandleFunc("GET /v1/host/containers/{id}/logs", h.hostContainerLogs)
 	mux.Handle("GET /v1/container-metrics", h.authenticate(http.HandlerFunc(h.getContainerMetrics)))
 
@@ -377,6 +383,97 @@ func (h *handler) removeHostImage(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := ops.RemoveImage(r.Context(), r.PathValue("id")); err != nil {
 		writeError(w, http.StatusBadGateway, "image_remove_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+}
+
+func (h *handler) pruneHostImages(w http.ResponseWriter, r *http.Request) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	deleted, reclaimed, err := ops.PruneImages(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "image_prune_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "reclaimed_bytes": reclaimed})
+}
+
+// hostContainerStats returns a CPU/memory snapshot for every running
+// container. A container that fails to report (e.g. it stopped between the
+// list and the stats call) is silently skipped rather than failing the
+// whole request.
+func (h *handler) hostContainerStats(w http.ResponseWriter, r *http.Request) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	containers, err := ops.ListAllContainers(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	stats := make([]docker.ContainerStat, 0, len(containers))
+	for _, c := range containers {
+		if c.State != "running" {
+			continue
+		}
+		stat, err := ops.ContainerStats(r.Context(), c.ID)
+		if err != nil {
+			continue
+		}
+		stats = append(stats, stat)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": stats})
+}
+
+func (h *handler) hostVolumes(w http.ResponseWriter, r *http.Request) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	volumes, err := ops.ListVolumes(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": volumes})
+}
+
+func (h *handler) removeHostVolume(w http.ResponseWriter, r *http.Request) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	if err := ops.RemoveVolume(r.Context(), r.PathValue("name")); err != nil {
+		writeError(w, http.StatusBadGateway, "volume_remove_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+}
+
+func (h *handler) hostNetworks(w http.ResponseWriter, r *http.Request) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	networks, err := ops.ListNetworks(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": networks})
+}
+
+func (h *handler) removeHostNetwork(w http.ResponseWriter, r *http.Request) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	if err := ops.RemoveNetwork(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusBadGateway, "network_remove_failed", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})

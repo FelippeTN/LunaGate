@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Boxes,
+  HardDrive,
   Layers,
   LayoutDashboard,
   LogOut,
   Menu,
   Moon,
+  Network as NetworkIcon,
   Plus,
   RefreshCw,
   ScrollText,
@@ -33,6 +35,8 @@ import {
   DeploymentsPanel,
   HostContainersPanel,
   ImagesPanel,
+  NetworksPanel,
+  VolumesPanel,
 } from "./ResourcePanels";
 import { EnvironmentPicker } from "./EnvironmentPicker";
 import {
@@ -54,7 +58,7 @@ function useTheme() {
   return { theme, toggle: () => setTheme((value) => (value === "dark" ? "light" : "dark")) };
 }
 
-type Tab = "overview" | "deployments" | "containers" | "images" | "logs";
+type Tab = "overview" | "deployments" | "containers" | "images" | "volumes" | "networks" | "logs";
 
 const TABS: { id: Tab; label: string; icon: typeof Boxes; description: string }[] = [
   {
@@ -80,6 +84,18 @@ const TABS: { id: Tab; label: string; icon: typeof Boxes; description: string }[
     label: "Images",
     icon: Layers,
     description: "Images in this host's local Docker store.",
+  },
+  {
+    id: "volumes",
+    label: "Volumes",
+    icon: HardDrive,
+    description: "Named volumes on this host's Docker store.",
+  },
+  {
+    id: "networks",
+    label: "Networks",
+    icon: NetworkIcon,
+    description: "Docker networks on the selected environment.",
   },
   {
     id: "logs",
@@ -345,7 +361,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
               onCreate={() => setCreating(true)}
             />
           )}
-          {(tab === "containers" || tab === "images" || tab === "logs") && (
+          {(tab === "containers" ||
+            tab === "images" ||
+            tab === "volumes" ||
+            tab === "networks" ||
+            tab === "logs") && (
             <EnvironmentPicker
               environments={environments}
               selected={envId}
@@ -355,6 +375,8 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
           )}
           {tab === "containers" && <HostContainersPanel envId={envId} />}
           {tab === "images" && <ImagesPanel envId={envId} />}
+          {tab === "volumes" && <VolumesPanel envId={envId} />}
+          {tab === "networks" && <NetworksPanel envId={envId} />}
           {tab === "logs" && <ContainerLogsPage key={envId} envId={envId} />}
         </main>
       </div>

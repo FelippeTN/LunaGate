@@ -39,6 +39,14 @@ func (stubDocker) StopContainer(context.Context, string) error        { return n
 func (stubDocker) RestartContainer(context.Context, string) error     { return nil }
 func (stubDocker) RemoveContainer(context.Context, string) error      { return nil }
 func (stubDocker) RemoveImage(context.Context, string) error          { return nil }
+func (stubDocker) ContainerStats(context.Context, string) (docker.ContainerStat, error) {
+	return docker.ContainerStat{}, nil
+}
+func (stubDocker) ListVolumes(context.Context) ([]docker.Volume, error)   { return nil, nil }
+func (stubDocker) RemoveVolume(context.Context, string) error             { return nil }
+func (stubDocker) ListNetworks(context.Context) ([]docker.Network, error) { return nil, nil }
+func (stubDocker) RemoveNetwork(context.Context, string) error            { return nil }
+func (stubDocker) PruneImages(context.Context) (int, int64, error)        { return 0, 0, nil }
 
 type gatewayDocker struct {
 	stubDocker

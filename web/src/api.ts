@@ -40,6 +40,28 @@ export type Image = {
   created: number;
 };
 
+export type ContainerStat = {
+  id: string;
+  cpu_percent: number;
+  mem_usage: number;
+  mem_limit: number;
+};
+
+export type Volume = {
+  name: string;
+  driver: string;
+  mountpoint: string;
+  labels?: Record<string, string>;
+};
+
+export type Network = {
+  id: string;
+  name: string;
+  driver: string;
+  scope: string;
+  builtin: boolean;
+};
+
 export type Environment = {
   id: string;
   name: string;
@@ -124,6 +146,31 @@ export const listImages = (env: string) =>
 
 export const removeImage = (env: string, id: string) =>
   req<unknown>(`/host/images/${id}?env=${encodeURIComponent(env)}`, { method: "DELETE" });
+
+export const pruneImages = (env: string) =>
+  req<{ deleted: number; reclaimed_bytes: number }>(
+    `/host/images/prune?env=${encodeURIComponent(env)}`,
+    { method: "POST" },
+  );
+
+export const listContainerStats = (env: string) =>
+  req<{ items: ContainerStat[] }>(`/host/containers/stats?env=${encodeURIComponent(env)}`).then(
+    (d) => d.items,
+  );
+
+export const listVolumes = (env: string) =>
+  req<{ items: Volume[] }>(`/host/volumes?env=${encodeURIComponent(env)}`).then((d) => d.items);
+
+export const removeVolume = (env: string, name: string) =>
+  req<unknown>(`/host/volumes/${encodeURIComponent(name)}?env=${encodeURIComponent(env)}`, {
+    method: "DELETE",
+  });
+
+export const listNetworks = (env: string) =>
+  req<{ items: Network[] }>(`/host/networks?env=${encodeURIComponent(env)}`).then((d) => d.items);
+
+export const removeNetwork = (env: string, id: string) =>
+  req<unknown>(`/host/networks/${id}?env=${encodeURIComponent(env)}`, { method: "DELETE" });
 
 export const listEnvironments = () =>
   req<{ items: Environment[] }>("/environments").then((d) => d.items);

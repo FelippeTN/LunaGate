@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import {
+  Eraser,
   Play,
   Plus,
   RefreshCw,
@@ -10,16 +11,24 @@ import {
 } from "lucide-react";
 import {
   hostLogsURL,
+  listContainerStats,
   listHostContainers,
   listImages,
+  listNetworks,
+  listVolumes,
+  pruneImages,
   removeContainer,
   removeImage,
+  removeNetwork,
+  removeVolume,
   restartContainer,
   startContainer,
   stopContainer,
   type Deployment,
   type HostContainer,
   type Image,
+  type Network,
+  type Volume,
 } from "@/api";
 import {
   Badge,
@@ -173,9 +182,11 @@ function useEnvScopedData<T>(envId: string, loader: (env: string) => Promise<T[]
 
 export function HostContainersPanel({ envId }: { envId: string }) {
   const { items: containers, error, loading, refresh } = useEnvScopedData(envId, listHostContainers);
+  const { items: stats } = useEnvScopedData(envId, listContainerStats);
   const [actionError, setActionError] = useState("");
   const [busy, setBusy] = useState("");
   const sortedContainers = sortContainers(containers);
+  const statsById = new Map(stats.map((s) => [s.id, s]));
 
   async function run(id: string, action: () => Promise<unknown>) {
     setBusy(id);
@@ -214,6 +225,8 @@ export function HostContainersPanel({ envId }: { envId: string }) {
             <TableHead>Name</TableHead>
             <TableHead>Image</TableHead>
             <TableHead>State</TableHead>
+            <TableHead className="text-right">CPU</TableHead>
+            <TableHead className="text-right">Mem</TableHead>
             <TableHead>Ports</TableHead>
             <TableHead>Owner</TableHead>
             <TableHead>Gateway</TableHead>
@@ -221,10 +234,10 @@ export function HostContainersPanel({ envId }: { envId: string }) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          {loading && <SkeletonRows cols={7} />}
+          {loading && <SkeletonRows cols={9} />}
           {!loading && !error && containers.length === 0 && (
             <TableRow>
-              <TableCell colSpan={7} className="h-auto py-12 text-center">
+              <TableCell colSpan={9} className="h-auto py-12 text-center">
                 <p className="text-sm font-medium">No containers on this host</p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   Nothing is running under this Docker daemon yet.
@@ -236,7 +249,7 @@ export function HostContainersPanel({ envId }: { envId: string }) {
             <Fragment key={c.id}>
               {(index === 0 || sortedContainers[index - 1].project !== c.project) && (
                 <TableRow className="bg-muted/50 hover:bg-muted/50">
-                  <TableCell colSpan={7} className="py-2 text-xs font-semibold">
+                  <TableCell colSpan={9} className="py-2 text-xs font-semibold">
                     {c.project || "Standalone containers"}
                   </TableCell>
                 </TableRow>
@@ -250,6 +263,14 @@ export function HostContainersPanel({ envId }: { envId: string }) {
               </TableCell>
               <TableCell>
                 <Badge variant={stateTone(c.state)}>{c.status || c.state}</Badge>
+              </TableCell>
+              <TableCell className="tabular text-right text-xs text-muted-foreground">
+                {statsById.get(c.id) ? `${statsById.get(c.id)!.cpu_percent.toFixed(1)}%` : "—"}
+              </TableCell>
+              <TableCell className="tabular text-right text-xs text-muted-foreground">
+                {statsById.get(c.id)
+                  ? `${formatSize(statsById.get(c.id)!.mem_usage)} / ${formatSize(statsById.get(c.id)!.mem_limit)}`
+                  : "—"}
               </TableCell>
               <TableCell className="tabular font-mono text-xs text-muted-foreground">
                 {c.ports.length ? c.ports.join(", ") : "—"}
@@ -419,13 +440,16 @@ export function ImagesPanel({ envId }: { envId: string }) {
   const { items: images, error, loading, refresh } = useEnvScopedData(envId, listImages);
   const total = images.reduce((n, i) => n + i.size, 0);
   const [actionError, setActionError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const [busy, setBusy] = useState("");
+  const [pruning, setPruning] = useState(false);
 
   async function handleRemove(img: Image) {
     const label = img.repo_tags.length ? img.repo_tags.join(", ") : img.id.slice(0, 12);
     if (!confirm(`Remove image "${label}"?`)) return;
     setBusy(img.id);
     setActionError("");
+    setStatusMessage("");
     try {
       await removeImage(envId, img.id);
       refresh();
@@ -436,6 +460,22 @@ export function ImagesPanel({ envId }: { envId: string }) {
     }
   }
 
+  async function handlePrune() {
+    if (!confirm("Remove all unused (<none>) images on this environment?")) return;
+    setPruning(true);
+    setActionError("");
+    setStatusMessage("");
+    try {
+      const result = await pruneImages(envId);
+      setStatusMessage(`Removed ${result.deleted} image(s), reclaimed ${formatSize(result.reclaimed_bytes)}.`);
+      refresh();
+    } catch (err) {
+      setActionError((err as Error).message);
+    } finally {
+      setPruning(false);
+    }
+  }
+
   return (
     <Card className="overflow-hidden">
       <CardHeader>
@@ -443,13 +483,24 @@ export function ImagesPanel({ envId }: { envId: string }) {
           <CardTitle>Images</CardTitle>
           <CardDescription>Local image store on the selected environment.</CardDescription>
         </div>
-        <Badge variant="muted" className="tabular">
-          {formatSize(total)} on disk
-        </Badge>
+        <div className="flex items-center gap-2">
+          <Badge variant="muted" className="tabular">
+            {formatSize(total)} on disk
+          </Badge>
+          <Button variant="outline" size="sm" disabled={pruning} onClick={handlePrune}>
+            <Eraser className="size-4" />
+            <span className="hidden sm:inline">Prune unused</span>
+          </Button>
+        </div>
       </CardHeader>
       {(error || actionError) && (
         <p className="border-b border-border bg-destructive/5 px-4 py-2 text-sm text-destructive">
           {error || actionError}
+        </p>
+      )}
+      {!error && !actionError && statusMessage && (
+        <p className="border-b border-border bg-muted/40 px-4 py-2 text-sm text-muted-foreground">
+          {statusMessage}
         </p>
       )}
       <Table>
@@ -500,6 +551,173 @@ export function ImagesPanel({ envId }: { envId: string }) {
                     onClick={() => handleRemove(img)}
                     aria-label={`Remove ${img.id.slice(0, 12)}`}
                     title="Remove"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
+  );
+}
+
+export function VolumesPanel({ envId }: { envId: string }) {
+  const { items: volumes, error, loading, refresh } = useEnvScopedData(envId, listVolumes);
+  const [actionError, setActionError] = useState("");
+  const [busy, setBusy] = useState("");
+
+  async function handleRemove(v: Volume) {
+    if (!confirm(`Remove volume "${v.name}"?`)) return;
+    setBusy(v.name);
+    setActionError("");
+    try {
+      await removeVolume(envId, v.name);
+      refresh();
+    } catch (err) {
+      setActionError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Card className="overflow-hidden">
+      <CardHeader>
+        <div>
+          <CardTitle>Volumes</CardTitle>
+          <CardDescription>Named volumes on the selected environment.</CardDescription>
+        </div>
+        <Badge variant="muted" className="tabular">
+          {volumes.length} volumes
+        </Badge>
+      </CardHeader>
+      {(error || actionError) && (
+        <p className="border-b border-border bg-destructive/5 px-4 py-2 text-sm text-destructive">
+          {error || actionError}
+        </p>
+      )}
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Name</TableHead>
+            <TableHead>Driver</TableHead>
+            <TableHead>Mountpoint</TableHead>
+            <TableHead className="text-right">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {loading && <SkeletonRows cols={4} />}
+          {!loading && !error && volumes.length === 0 && (
+            <TableRow>
+              <TableCell colSpan={4} className="h-auto py-12 text-center">
+                <p className="text-sm font-medium">No volumes on this host</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Volumes created by containers will appear here.
+                </p>
+              </TableCell>
+            </TableRow>
+          )}
+          {volumes.map((v) => (
+            <TableRow key={v.name}>
+              <TableCell className="font-medium">{v.name}</TableCell>
+              <TableCell className="text-xs text-muted-foreground">{v.driver}</TableCell>
+              <TableCell className="max-w-[24rem] truncate font-mono text-xs text-muted-foreground">
+                {v.mountpoint}
+              </TableCell>
+              <TableCell>
+                <div className="flex justify-end">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                    disabled={busy === v.name}
+                    onClick={() => handleRemove(v)}
+                    aria-label={`Remove ${v.name}`}
+                    title="Remove"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
+  );
+}
+
+export function NetworksPanel({ envId }: { envId: string }) {
+  const { items: networks, error, loading, refresh } = useEnvScopedData(envId, listNetworks);
+  const [actionError, setActionError] = useState("");
+  const [busy, setBusy] = useState("");
+
+  async function handleRemove(n: Network) {
+    if (!confirm(`Remove network "${n.name}"?`)) return;
+    setBusy(n.id);
+    setActionError("");
+    try {
+      await removeNetwork(envId, n.id);
+      refresh();
+    } catch (err) {
+      setActionError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <Card className="overflow-hidden">
+      <CardHeader>
+        <div>
+          <CardTitle>Networks</CardTitle>
+          <CardDescription>Docker networks on the selected environment.</CardDescription>
+        </div>
+        <Badge variant="muted" className="tabular">
+          {networks.length} networks
+        </Badge>
+      </CardHeader>
+      {(error || actionError) && (
+        <p className="border-b border-border bg-destructive/5 px-4 py-2 text-sm text-destructive">
+          {error || actionError}
+        </p>
+      )}
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Name</TableHead>
+            <TableHead>Driver</TableHead>
+            <TableHead>Scope</TableHead>
+            <TableHead className="text-right">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {loading && <SkeletonRows cols={4} />}
+          {!loading && !error && networks.length === 0 && (
+            <TableRow>
+              <TableCell colSpan={4} className="h-auto py-12 text-center">
+                <p className="text-sm font-medium">No networks on this host</p>
+              </TableCell>
+            </TableRow>
+          )}
+          {networks.map((n) => (
+            <TableRow key={n.id}>
+              <TableCell className="font-medium">{n.name}</TableCell>
+              <TableCell className="text-xs text-muted-foreground">{n.driver}</TableCell>
+              <TableCell className="text-xs text-muted-foreground">{n.scope}</TableCell>
+              <TableCell>
+                <div className="flex justify-end">
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                    disabled={busy === n.id || n.builtin}
+                    onClick={() => handleRemove(n)}
+                    aria-label={`Remove ${n.name}`}
+                    title={n.builtin ? "Built-in network" : "Remove"}
                   >
                     <Trash2 className="size-3.5" />
                   </Button>
