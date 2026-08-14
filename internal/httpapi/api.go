@@ -101,6 +101,7 @@ func New(db *store.Store, dockerOps docker.ContainerOps, envs environmentManager
 	mux.Handle("POST /v1/host/containers/{id}/stop", h.authenticate(http.HandlerFunc(h.stopHostContainer)))
 	mux.Handle("POST /v1/host/containers/{id}/restart", h.authenticate(http.HandlerFunc(h.restartHostContainer)))
 	mux.Handle("DELETE /v1/host/containers/{id}", h.authenticate(http.HandlerFunc(h.removeHostContainer)))
+	mux.Handle("DELETE /v1/host/images/{id}", h.authenticate(http.HandlerFunc(h.removeHostImage)))
 	mux.HandleFunc("GET /v1/host/containers/{id}/logs", h.hostContainerLogs)
 	mux.Handle("GET /v1/container-metrics", h.authenticate(http.HandlerFunc(h.getContainerMetrics)))
 
@@ -367,6 +368,18 @@ func (h *handler) restartHostContainer(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) removeHostContainer(w http.ResponseWriter, r *http.Request) {
 	h.containerAction(w, r, "remove", docker.ContainerOps.RemoveContainer)
+}
+
+func (h *handler) removeHostImage(w http.ResponseWriter, r *http.Request) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	if err := ops.RemoveImage(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusBadGateway, "image_remove_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
 func (h *handler) containerAction(w http.ResponseWriter, r *http.Request, action string, run func(docker.ContainerOps, context.Context, string) error) {

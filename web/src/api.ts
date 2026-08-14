@@ -122,6 +122,9 @@ export const removeContainer = (env: string, id: string) =>
 export const listImages = (env: string) =>
   req<{ items: Image[] }>(`/host/images?env=${encodeURIComponent(env)}`).then((d) => d.items);
 
+export const removeImage = (env: string, id: string) =>
+  req<unknown>(`/host/images/${id}?env=${encodeURIComponent(env)}`, { method: "DELETE" });
+
 export const listEnvironments = () =>
   req<{ items: Environment[] }>("/environments").then((d) => d.items);
 

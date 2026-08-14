@@ -5,6 +5,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,8 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	"golang.org/x/crypto/ssh"
@@ -80,6 +83,28 @@ type Image struct {
 	Created  int64    `json:"created"`
 }
 
+type ContainerStat struct {
+	ID         string  `json:"id"`
+	CPUPercent float64 `json:"cpu_percent"`
+	MemUsage   int64   `json:"mem_usage"`
+	MemLimit   int64   `json:"mem_limit"`
+}
+
+type Volume struct {
+	Name       string            `json:"name"`
+	Driver     string            `json:"driver"`
+	Mountpoint string            `json:"mountpoint"`
+	Labels     map[string]string `json:"labels,omitempty"`
+}
+
+type Network struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Driver  string `json:"driver"`
+	Scope   string `json:"scope"`
+	Builtin bool   `json:"builtin"`
+}
+
 type ContainerOps interface {
 	ListByDeployment(context.Context, string) ([]Container, error)
 	StopAndRemove(context.Context, string) error
@@ -90,6 +115,13 @@ type ContainerOps interface {
 	StopContainer(context.Context, string) error
 	RestartContainer(context.Context, string) error
 	RemoveContainer(context.Context, string) error
+	RemoveImage(context.Context, string) error
+	ContainerStats(context.Context, string) (ContainerStat, error)
+	ListVolumes(context.Context) ([]Volume, error)
+	RemoveVolume(context.Context, string) error
+	ListNetworks(context.Context) ([]Network, error)
+	RemoveNetwork(context.Context, string) error
+	PruneImages(context.Context) (int, int64, error)
 }
 
 type LogStream struct {
@@ -474,6 +506,93 @@ func (c *Client) RestartContainer(ctx context.Context, id string) error {
 
 func (c *Client) RemoveContainer(ctx context.Context, id string) error {
 	return c.cli.ContainerRemove(ctx, id, container.RemoveOptions{})
+}
+
+func (c *Client) RemoveImage(ctx context.Context, id string) error {
+	_, err := c.cli.ImageRemove(ctx, id, image.RemoveOptions{Force: true})
+	return err
+}
+
+// ContainerStats fetches a single-shot CPU/memory snapshot for a running
+// container, using the same formula as `docker stats`.
+func (c *Client) ContainerStats(ctx context.Context, id string) (ContainerStat, error) {
+	resp, err := c.cli.ContainerStatsOneShot(ctx, id)
+	if err != nil {
+		return ContainerStat{}, err
+	}
+	defer resp.Body.Close()
+
+	var raw container.Stats
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return ContainerStat{}, err
+	}
+
+	var cpuPercent float64
+	cpuDelta := float64(raw.CPUStats.CPUUsage.TotalUsage) - float64(raw.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(raw.CPUStats.SystemUsage) - float64(raw.PreCPUStats.SystemUsage)
+	if systemDelta > 0 && cpuDelta > 0 {
+		cpuPercent = (cpuDelta / systemDelta) * float64(raw.CPUStats.OnlineCPUs) * 100
+	}
+
+	return ContainerStat{
+		ID:         id,
+		CPUPercent: cpuPercent,
+		MemUsage:   int64(raw.MemoryStats.Usage),
+		MemLimit:   int64(raw.MemoryStats.Limit),
+	}, nil
+}
+
+func (c *Client) ListVolumes(ctx context.Context) ([]Volume, error) {
+	resp, err := c.cli.VolumeList(ctx, volume.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Volume, 0, len(resp.Volumes))
+	for _, v := range resp.Volumes {
+		out = append(out, Volume{
+			Name:       v.Name,
+			Driver:     v.Driver,
+			Mountpoint: v.Mountpoint,
+			Labels:     v.Labels,
+		})
+	}
+	return out, nil
+}
+
+func (c *Client) RemoveVolume(ctx context.Context, name string) error {
+	return c.cli.VolumeRemove(ctx, name, false)
+}
+
+func (c *Client) ListNetworks(ctx context.Context) ([]Network, error) {
+	list, err := c.cli.NetworkList(ctx, network.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Network, 0, len(list))
+	for _, n := range list {
+		out = append(out, Network{
+			ID:      n.ID,
+			Name:    n.Name,
+			Driver:  n.Driver,
+			Scope:   n.Scope,
+			Builtin: n.Name == "bridge" || n.Name == "host" || n.Name == "none",
+		})
+	}
+	return out, nil
+}
+
+func (c *Client) RemoveNetwork(ctx context.Context, id string) error {
+	return c.cli.NetworkRemove(ctx, id)
+}
+
+// PruneImages deletes dangling (<none>) images and reports how much disk
+// space was reclaimed.
+func (c *Client) PruneImages(ctx context.Context) (int, int64, error) {
+	report, err := c.cli.ImagesPrune(ctx, filters.NewArgs(filters.Arg("dangling", "true")))
+	if err != nil {
+		return 0, 0, err
+	}
+	return len(report.ImagesDeleted), int64(report.SpaceReclaimed), nil
 }
 
 func (c *Client) ListByDeployment(ctx context.Context, deploymentID string) ([]Container, error) {

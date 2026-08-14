@@ -38,6 +38,7 @@ func (stubDocker) StartContainer(context.Context, string) error       { return n
 func (stubDocker) StopContainer(context.Context, string) error        { return nil }
 func (stubDocker) RestartContainer(context.Context, string) error     { return nil }
 func (stubDocker) RemoveContainer(context.Context, string) error      { return nil }
+func (stubDocker) RemoveImage(context.Context, string) error          { return nil }
 
 type gatewayDocker struct {
 	stubDocker
