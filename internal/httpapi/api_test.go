@@ -211,11 +211,11 @@ func TestOnlyRunningContainerRequestsAreCounted(t *testing.T) {
 	dockerOps := &gatewayDocker{
 		containers: []docker.Container{{ID: "running", State: "running"}},
 		hostContainers: []docker.HostContainer{{
-			ID: "running", Names: []string{"/local-running"}, State: "running", Ports: []string{fmt.Sprintf("%d:80/tcp", port)},
+			ID: "running", Names: []string{"/local-running"}, State: "running", Managed: true, Ports: []string{fmt.Sprintf("%d:80/tcp", port)},
 		}},
 	}
 	remoteOps := &gatewayDocker{hostContainers: []docker.HostContainer{{
-		ID: "remote-running", State: "running", Ports: []string{fmt.Sprintf("%d:80/tcp", port)},
+		ID: "remote-running", State: "running", Managed: true, Ports: []string{fmt.Sprintf("%d:80/tcp", port)},
 	}}}
 	envs := gatewayEnvironments{remote: remoteOps}
 	server := httptest.NewServer(httpapi.New(db, dockerOps, envs, "secret", slog.New(slog.NewTextHandler(io.Discard, nil))))

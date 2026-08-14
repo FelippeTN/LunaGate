@@ -622,7 +622,7 @@ func (h *handler) localContainerGateway(w http.ResponseWriter, r *http.Request) 
 			break
 		}
 	}
-	if container == nil {
+	if container == nil || !container.Managed {
 		writeError(w, http.StatusNotFound, "not_found", "container not found")
 		return
 	}
@@ -677,6 +677,10 @@ func (h *handler) sshGateway(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if container == nil {
+		writeError(w, http.StatusNotFound, "not_found", "container not found")
+		return
+	}
+	if !container.Managed {
 		writeError(w, http.StatusNotFound, "not_found", "container not found")
 		return
 	}

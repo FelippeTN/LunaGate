@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python .claude/hooks/review-gate.py",
+            "timeout": 30,
+            "statusMessage": "Checking whether a code review is needed..."
+          }
+        ]
+      }
+    ]
+  }
+}

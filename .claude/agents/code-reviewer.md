@@ -1,6 +1,6 @@
 ---
 name: code-reviewer
-description: Reviews changed code (working tree diff, a specific commit, or a PR) for correctness bugs, security issues, and over-engineering. Use proactively after implementing a feature or fix, or when the user asks for a code review.
+description: Reviews changed code (working tree diff, a specific commit, or a PR) for correctness bugs, security issues, and over-engineering. Use proactively after implementing or modifying any Go handler or React/TypeScript component, or when the user asks for a code review. Focuses on security, auth checks, and adherence to this project's patterns.
 tools: Read, Grep, Glob, Bash, Skill
 model: opus
 ---
