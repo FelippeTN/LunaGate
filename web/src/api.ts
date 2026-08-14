@@ -29,6 +29,7 @@ export type HostContainer = {
   ports: string[];
   created: number;
   managed: boolean;
+  project?: string;
   deployment?: string;
 };
 
@@ -47,11 +48,10 @@ export type Environment = {
   created_at?: number;
 };
 
-export type Metrics = {
-  total_requests: number;
-  requests_last_minute: number;
-  average_latency_ms: number;
-  uptime_seconds: number;
+export type ContainerMetrics = {
+  container_requests_total: number;
+  container_requests_last_minute: number;
+  container_average_latency_ms: number;
   last_minute: {
     success: number;
     client_error: number;
@@ -107,13 +107,25 @@ export const listHostContainers = (env: string) =>
     (d) => d.items,
   );
 
+export const startContainer = (env: string, id: string) =>
+  req<unknown>(`/host/containers/${id}/start?env=${encodeURIComponent(env)}`, { method: "POST" });
+
+export const stopContainer = (env: string, id: string) =>
+  req<unknown>(`/host/containers/${id}/stop?env=${encodeURIComponent(env)}`, { method: "POST" });
+
+export const restartContainer = (env: string, id: string) =>
+  req<unknown>(`/host/containers/${id}/restart?env=${encodeURIComponent(env)}`, { method: "POST" });
+
+export const removeContainer = (env: string, id: string) =>
+  req<unknown>(`/host/containers/${id}?env=${encodeURIComponent(env)}`, { method: "DELETE" });
+
 export const listImages = (env: string) =>
   req<{ items: Image[] }>(`/host/images?env=${encodeURIComponent(env)}`).then((d) => d.items);
 
 export const listEnvironments = () =>
   req<{ items: Environment[] }>("/environments").then((d) => d.items);
 
-export const getMetrics = () => req<Metrics>("/metrics");
+export const getContainerMetrics = () => req<ContainerMetrics>("/container-metrics");
 
 export const createEnvironment = (name: string, sshHost: string, password: string) =>
   req<Environment>("/environments", {
@@ -127,5 +139,8 @@ export const deleteEnvironment = (id: string) =>
 // EventSource can't send headers, so the token rides as a query param.
 export const logsURL = (id: string) =>
   `/v1/deployments/${id}/logs?token=${encodeURIComponent(getToken())}`;
+
+export const hostLogsURL = (env: string, id: string) =>
+  `/v1/host/containers/${id}/logs?env=${encodeURIComponent(env)}&token=${encodeURIComponent(getToken())}`;
 
 export const webhookURL = (id: string) => `${location.origin}/v1/webhooks/${id}`;

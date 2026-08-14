@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   Boxes,
@@ -10,10 +10,13 @@ import {
   LogOut,
   Menu,
   Moon,
+  Play,
   Plus,
   RefreshCw,
+  RotateCw,
   ScrollText,
   Server,
+  Square,
   Sun,
   Trash2,
   Wifi,
@@ -25,20 +28,25 @@ import {
   createEnvironment,
   deleteDeployment,
   deleteEnvironment,
-  getMetrics,
+  getContainerMetrics,
   getToken,
+  hostLogsURL,
   listDeployments,
   listEnvironments,
   listHostContainers,
   listImages,
   logsURL,
   redeploy,
+  removeContainer,
+  restartContainer,
   setToken,
+  startContainer,
+  stopContainer,
   webhookURL,
   type Deployment,
   type Environment,
   type HostContainer,
-  type Metrics,
+  type ContainerMetrics,
   type NewDeployment,
 } from "@/api";
 import {
@@ -158,7 +166,7 @@ function TokenGate({ onDone }: { onDone: () => void }) {
   );
 }
 
-type Tab = "overview" | "deployments" | "containers" | "images";
+type Tab = "overview" | "deployments" | "containers" | "images" | "logs";
 
 const TABS: { id: Tab; label: string; icon: typeof Boxes; description: string }[] = [
   {
@@ -185,6 +193,12 @@ const TABS: { id: Tab; label: string; icon: typeof Boxes; description: string }[
     icon: Layers,
     description: "Images in this host's local Docker store.",
   },
+  {
+    id: "logs",
+    label: "Logs",
+    icon: ScrollText,
+    description: "Live output from containers on local and SSH environments.",
+  },
 ];
 
 const LOCAL_ENV: Environment = { id: "local", name: "This machine", kind: "local" };
@@ -194,7 +208,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [navOpen, setNavOpen] = useState(false);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [localContainers, setLocalContainers] = useState<HostContainer[]>([]);
-  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [metrics, setMetrics] = useState<ContainerMetrics | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -222,7 +236,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
     const [d, c, m] = await Promise.allSettled([
       listDeployments(),
       listHostContainers("local"),
-      getMetrics(),
+      getContainerMetrics(),
     ]);
     if (d.status === "fulfilled") setDeployments(d.value);
     if (c.status === "fulfilled") setLocalContainers(c.value);
@@ -443,7 +457,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
               onCreate={() => setCreating(true)}
             />
           )}
-          {(tab === "containers" || tab === "images") && (
+          {(tab === "containers" || tab === "images" || tab === "logs") && (
             <EnvironmentPicker
               environments={environments}
               selected={envId}
@@ -453,6 +467,7 @@ function Dashboard({ onLogout }: { onLogout: () => void }) {
           )}
           {tab === "containers" && <HostContainersPanel envId={envId} />}
           {tab === "images" && <ImagesPanel envId={envId} />}
+          {tab === "logs" && <ContainerLogsPage key={envId} envId={envId} />}
         </main>
       </div>
 
@@ -492,7 +507,7 @@ function OverviewPanel({
   running: Map<string, number>;
   environments: Environment[];
   localContainers: HostContainer[];
-  metrics: Metrics | null;
+  metrics: ContainerMetrics | null;
   loading: boolean;
   refreshKey: number;
 }) {
@@ -540,7 +555,6 @@ function OverviewPanel({
       loading: !snapshot,
     };
   });
-  const maxContainers = Math.max(1, ...snapshots.map((item) => item.containers.length));
 
   return (
     <div className="grid gap-4 xl:grid-cols-2">
@@ -549,14 +563,10 @@ function OverviewPanel({
           <div>
             <CardTitle>Running container traffic</CardTitle>
             <CardDescription>
-              Only requests proxied through /gateway/deployment-slug while a container is running.
+              Only responses from running local or SSH containers reached through their gateway URL.
             </CardDescription>
           </div>
-          {metrics && (
-            <Badge variant="muted" className="tabular">
-              Collector up {formatUptime(metrics.uptime_seconds)}
-            </Badge>
-          )}
+          <Badge variant="success">Containers only</Badge>
         </CardHeader>
         <div className="grid grid-cols-2 gap-px border-t border-border bg-border lg:grid-cols-4">
           {loading || !metrics ? (
@@ -567,9 +577,9 @@ function OverviewPanel({
             ))
           ) : (
             <>
-              <TrafficStat label="Container requests · 60s" value={String(metrics.requests_last_minute)} />
-              <TrafficStat label="Container requests · total" value={String(metrics.total_requests)} />
-              <TrafficStat label="Container latency · 60s" value={`${metrics.average_latency_ms.toFixed(1)} ms`} />
+              <TrafficStat label="Container requests · 60s" value={String(metrics.container_requests_last_minute)} />
+              <TrafficStat label="Container requests · total" value={String(metrics.container_requests_total)} />
+              <TrafficStat label="Container latency · 60s" value={`${metrics.container_average_latency_ms.toFixed(1)} ms`} />
               <TrafficStat
                 label="Container errors · 60s"
                 value={`${metrics.last_minute.server_error} (${errorRate(metrics)}%)`}
@@ -686,11 +696,11 @@ function OverviewPanel({
                   <div className="ml-6 flex h-2 overflow-hidden rounded-full bg-muted">
                     <div
                       className="bg-success"
-                      style={{ width: `${(runningCount / maxContainers) * 100}%` }}
+                      style={{ width: `${(runningCount / Math.max(1, containers.length)) * 100}%` }}
                     />
                     <div
                       className="bg-warning"
-                      style={{ width: `${(stoppedCount / maxContainers) * 100}%` }}
+                      style={{ width: `${(stoppedCount / Math.max(1, containers.length)) * 100}%` }}
                     />
                   </div>
                 )}
@@ -729,16 +739,9 @@ function TrafficStat({ label, value, bad = false }: { label: string; value: stri
   );
 }
 
-function errorRate(metrics: Metrics) {
+function errorRate(metrics: ContainerMetrics) {
   const total = Object.values(metrics.last_minute).reduce((sum, value) => sum + value, 0);
   return total ? ((metrics.last_minute.server_error / total) * 100).toFixed(1) : "0.0";
-}
-
-function formatUptime(seconds: number) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}d`;
 }
 
 type Stat = { label: string; value: string; tone?: "good" | "bad" | "neutral" };
@@ -876,6 +879,7 @@ function useEnvScopedData<T>(envId: string, loader: (env: string) => Promise<T[]
   const [items, setItems] = useState<T[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [revision, setRevision] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -899,13 +903,29 @@ function useEnvScopedData<T>(envId: string, loader: (env: string) => Promise<T[]
       clearInterval(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [envId]);
+  }, [envId, revision]);
 
-  return { items, error, loading };
+  return { items, error, loading, refresh: () => setRevision((value) => value + 1) };
 }
 
 function HostContainersPanel({ envId }: { envId: string }) {
-  const { items: containers, error, loading } = useEnvScopedData(envId, listHostContainers);
+  const { items: containers, error, loading, refresh } = useEnvScopedData(envId, listHostContainers);
+  const [actionError, setActionError] = useState("");
+  const [busy, setBusy] = useState("");
+  const sortedContainers = sortContainers(containers);
+
+  async function run(id: string, action: () => Promise<unknown>) {
+    setBusy(id);
+    setActionError("");
+    try {
+      await action();
+      refresh();
+    } catch (err) {
+      setActionError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  }
 
   return (
     <Card className="overflow-hidden">
@@ -913,16 +933,16 @@ function HostContainersPanel({ envId }: { envId: string }) {
         <div>
           <CardTitle>Host containers</CardTitle>
           <CardDescription>
-            Read-only. LunaGate never stops a container it does not own.
+            Grouped by Compose project (-p), then name. Managed containers still follow deployment desired state.
           </CardDescription>
         </div>
         <Badge variant="muted" className="tabular">
-          {containers.filter((c) => c.managed).length} managed
+          {containers.length} containers · by project
         </Badge>
       </CardHeader>
-      {error && (
+      {(error || actionError) && (
         <p className="border-b border-border bg-destructive/5 px-4 py-2 text-sm text-destructive">
-          {error}
+          {error || actionError}
         </p>
       )}
       <Table>
@@ -933,13 +953,15 @@ function HostContainersPanel({ envId }: { envId: string }) {
             <TableHead>State</TableHead>
             <TableHead>Ports</TableHead>
             <TableHead>Owner</TableHead>
+            <TableHead>Gateway</TableHead>
+            <TableHead className="text-right">Actions</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {loading && <SkeletonRows cols={5} />}
+          {loading && <SkeletonRows cols={7} />}
           {!loading && !error && containers.length === 0 && (
             <TableRow>
-              <TableCell colSpan={5} className="h-auto py-12 text-center">
+              <TableCell colSpan={7} className="h-auto py-12 text-center">
                 <p className="text-sm font-medium">No containers on this host</p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   Nothing is running under this Docker daemon yet.
@@ -947,8 +969,16 @@ function HostContainersPanel({ envId }: { envId: string }) {
               </TableCell>
             </TableRow>
           )}
-          {containers.map((c) => (
-            <TableRow key={c.id}>
+          {sortedContainers.map((c, index) => (
+            <Fragment key={c.id}>
+              {(index === 0 || sortedContainers[index - 1].project !== c.project) && (
+                <TableRow className="bg-muted/50 hover:bg-muted/50">
+                  <TableCell colSpan={7} className="py-2 text-xs font-semibold">
+                    {c.project || "Standalone containers"}
+                  </TableCell>
+                </TableRow>
+              )}
+              <TableRow>
               <TableCell className="font-medium">
                 {c.names[0]?.replace(/^\//, "") ?? c.id.slice(0, 12)}
               </TableCell>
@@ -968,10 +998,156 @@ function HostContainersPanel({ envId }: { envId: string }) {
                   <span className="text-muted-foreground">External</span>
                 )}
               </TableCell>
-            </TableRow>
+              <TableCell className="text-xs">
+                {envId !== "local" && c.state === "running" && hasPublishedTCPPort(c) ? (
+                  <a
+                    className="font-medium text-primary hover:underline"
+                    href={sshGatewayURL(envId, c.id)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open
+                  </a>
+                ) : (
+                  <span className="text-muted-foreground">—</span>
+                )}
+              </TableCell>
+              <TableCell>
+                <div className="flex justify-end gap-1">
+                  {c.state === "running" ? (
+                    <>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        disabled={busy === c.id}
+                        onClick={() => run(c.id, () => stopContainer(envId, c.id))}
+                        aria-label={`Stop ${containerName(c)}`}
+                        title="Stop"
+                      >
+                        <Square className="size-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        disabled={busy === c.id}
+                        onClick={() => run(c.id, () => restartContainer(envId, c.id))}
+                        aria-label={`Restart ${containerName(c)}`}
+                        title="Restart"
+                      >
+                        <RotateCw className="size-3.5" />
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled={busy === c.id}
+                      onClick={() => run(c.id, () => startContainer(envId, c.id))}
+                      aria-label={`Start ${containerName(c)}`}
+                      title="Start"
+                    >
+                      <Play className="size-3.5" />
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                    disabled={busy === c.id || c.state === "running"}
+                    onClick={() => {
+                      if (confirm(`Remove "${containerName(c)}"?`)) {
+                        run(c.id, () => removeContainer(envId, c.id));
+                      }
+                    }}
+                    aria-label={`Remove ${containerName(c)}`}
+                    title={c.state === "running" ? "Stop before removing" : "Remove"}
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </div>
+              </TableCell>
+              </TableRow>
+            </Fragment>
           ))}
         </TableBody>
       </Table>
+    </Card>
+  );
+}
+
+function ContainerLogsPage({ envId }: { envId: string }) {
+  const { items: containers, error, loading } = useEnvScopedData(envId, listHostContainers);
+  const sorted = sortContainers(containers);
+  const [selected, setSelected] = useState("");
+  const [lines, setLines] = useState<string[]>([]);
+  const [ended, setEnded] = useState(false);
+  const boxRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!sorted.some((container) => container.id === selected)) {
+      setSelected(sorted[0]?.id ?? "");
+    }
+  }, [containers, selected]);
+
+  useEffect(() => {
+    if (!selected) {
+      setLines([]);
+      return;
+    }
+    setLines([]);
+    setEnded(false);
+    const stream = new EventSource(hostLogsURL(envId, selected));
+    stream.onmessage = (event) => setLines((current) => [...current.slice(-1000), event.data]);
+    stream.onerror = () => {
+      setEnded(true);
+      stream.close();
+    };
+    return () => stream.close();
+  }, [envId, selected]);
+
+  useEffect(() => {
+    boxRef.current?.scrollTo(0, boxRef.current.scrollHeight);
+  }, [lines]);
+
+  return (
+    <Card className="flex min-h-[32rem] flex-col overflow-hidden">
+      <CardHeader>
+        <div>
+          <CardTitle>Container logs</CardTitle>
+          <CardDescription>Live stdout and stderr from local or SSH containers.</CardDescription>
+        </div>
+        <select
+          className="h-8 max-w-64 rounded-md border border-input bg-background px-2 text-xs outline-none focus:ring-2 focus:ring-ring"
+          value={selected}
+          disabled={loading || sorted.length === 0}
+          onChange={(event) => setSelected(event.target.value)}
+          aria-label="Container"
+        >
+          {sorted.length === 0 && <option value="">No containers</option>}
+          {sorted.map((container) => (
+            <option key={container.id} value={container.id}>
+              {container.project ? `${container.project} / ` : ""}{containerName(container)} · {container.state}
+            </option>
+          ))}
+        </select>
+      </CardHeader>
+      {error && (
+        <p className="border-b border-border bg-destructive/5 px-4 py-2 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+      <div ref={boxRef} className="flex-1 overflow-auto bg-background p-3 font-mono text-xs leading-relaxed">
+        {lines.length === 0 ? (
+          <p className="text-muted-foreground">
+            {loading ? "Loading containers…" : ended ? "Stream ended or no logs available." : selected ? "Waiting for output…" : "Select an environment with containers."}
+          </p>
+        ) : (
+          lines.map((line, index) => (
+            <div key={index} className="whitespace-pre-wrap break-all">{line}</div>
+          ))
+        )}
+        {ended && lines.length > 0 && <p className="mt-2 text-muted-foreground">— stream ended —</p>}
+      </div>
     </Card>
   );
 }
@@ -1568,6 +1744,25 @@ function stateTone(state: string) {
 function formatSize(bytes: number) {
   const mb = bytes / 1e6;
   return mb >= 1000 ? `${(mb / 1000).toFixed(2)} GB` : `${mb.toFixed(0)} MB`;
+}
+
+function hasPublishedTCPPort(container: HostContainer) {
+  return container.ports.some((port) => /^\d+:\d+\/tcp$/.test(port));
+}
+
+function containerName(container: HostContainer) {
+  return container.names[0]?.replace(/^\//, "") ?? container.id.slice(0, 12);
+}
+
+function sortContainers(containers: HostContainer[]) {
+  return [...containers].sort((a, b) =>
+    (a.project || "\uffff").localeCompare(b.project || "\uffff") ||
+    containerName(a).localeCompare(containerName(b)),
+  );
+}
+
+function sshGatewayURL(environment: string, container: string) {
+  return `/gateway/ssh/${encodeURIComponent(environment)}/${encodeURIComponent(container)}/`;
 }
 
 function timeAgo(unixSeconds: number) {

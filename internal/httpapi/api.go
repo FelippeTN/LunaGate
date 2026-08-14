@@ -16,10 +16,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,12 +31,10 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
-type containerOps interface {
-	ListByDeployment(ctx context.Context, deploymentID string) ([]docker.Container, error)
-	StopAndRemove(ctx context.Context, id string) error
-	Logs(ctx context.Context, id string, follow bool) (io.ReadCloser, error)
-	ListAllContainers(ctx context.Context) ([]docker.HostContainer, error)
-	ListImages(ctx context.Context) ([]docker.Image, error)
+type environmentManager interface {
+	Remote(sshHost, password string) (docker.ContainerOps, error)
+	DialContext(ctx context.Context, sshHost, password, target string) (net.Conn, error)
+	Forget(sshHost string)
 }
 
 const maxBodySize = 1 << 20
@@ -43,8 +43,8 @@ var slugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 type handler struct {
 	store     *store.Store
-	docker    containerOps
-	envs      *docker.Manager
+	docker    docker.ContainerOps
+	envs      environmentManager
 	adminHash [32]byte
 	logger    *slog.Logger
 	metrics   requestMetrics
@@ -59,7 +59,6 @@ type metricBucket struct {
 
 type requestMetrics struct {
 	mu      sync.Mutex
-	started time.Time
 	total   uint64
 	buckets [60]metricBucket
 }
@@ -73,14 +72,15 @@ type apiInput struct {
 
 // envs resolves non-local environments (?env=<id> beyond "local"); it may be
 // nil if the caller never needs remote hosts.
-func New(db *store.Store, dockerOps containerOps, envs *docker.Manager, adminToken string, logger *slog.Logger) http.Handler {
+func New(db *store.Store, dockerOps docker.ContainerOps, envs environmentManager, adminToken string, logger *slog.Logger) http.Handler {
 	h := &handler{store: db, docker: dockerOps, envs: envs, adminHash: sha256.Sum256([]byte(adminToken)), logger: logger}
-	h.metrics.started = time.Now()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.health)
 	mux.HandleFunc("GET /readyz", h.ready)
 	mux.HandleFunc("/gateway/{slug}", h.gateway)
 	mux.HandleFunc("/gateway/{slug}/{path...}", h.gateway)
+	mux.HandleFunc("/gateway/ssh/{environment}/{container}", h.sshGateway)
+	mux.HandleFunc("/gateway/ssh/{environment}/{container}/{path...}", h.sshGateway)
 	mux.Handle("GET /v1/apis", h.authenticate(http.HandlerFunc(h.listAPIs)))
 	mux.Handle("POST /v1/apis", h.authenticate(http.HandlerFunc(h.createAPI)))
 	mux.Handle("GET /v1/apis/{id}", h.authenticate(http.HandlerFunc(h.getAPI)))
@@ -97,7 +97,12 @@ func New(db *store.Store, dockerOps containerOps, envs *docker.Manager, adminTok
 
 	mux.Handle("GET /v1/host/containers", h.authenticate(http.HandlerFunc(h.hostContainers)))
 	mux.Handle("GET /v1/host/images", h.authenticate(http.HandlerFunc(h.hostImages)))
-	mux.Handle("GET /v1/metrics", h.authenticate(http.HandlerFunc(h.getMetrics)))
+	mux.Handle("POST /v1/host/containers/{id}/start", h.authenticate(http.HandlerFunc(h.startHostContainer)))
+	mux.Handle("POST /v1/host/containers/{id}/stop", h.authenticate(http.HandlerFunc(h.stopHostContainer)))
+	mux.Handle("POST /v1/host/containers/{id}/restart", h.authenticate(http.HandlerFunc(h.restartHostContainer)))
+	mux.Handle("DELETE /v1/host/containers/{id}", h.authenticate(http.HandlerFunc(h.removeHostContainer)))
+	mux.HandleFunc("GET /v1/host/containers/{id}/logs", h.hostContainerLogs)
+	mux.Handle("GET /v1/container-metrics", h.authenticate(http.HandlerFunc(h.getContainerMetrics)))
 
 	mux.Handle("GET /v1/environments", h.authenticate(http.HandlerFunc(h.listEnvironments)))
 	mux.Handle("POST /v1/environments", h.authenticate(http.HandlerFunc(h.createEnvironment)))
@@ -348,7 +353,35 @@ func (h *handler) hostImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": images})
 }
 
-func (h *handler) getMetrics(w http.ResponseWriter, _ *http.Request) {
+func (h *handler) startHostContainer(w http.ResponseWriter, r *http.Request) {
+	h.containerAction(w, r, "start", docker.ContainerOps.StartContainer)
+}
+
+func (h *handler) stopHostContainer(w http.ResponseWriter, r *http.Request) {
+	h.containerAction(w, r, "stop", docker.ContainerOps.StopContainer)
+}
+
+func (h *handler) restartHostContainer(w http.ResponseWriter, r *http.Request) {
+	h.containerAction(w, r, "restart", docker.ContainerOps.RestartContainer)
+}
+
+func (h *handler) removeHostContainer(w http.ResponseWriter, r *http.Request) {
+	h.containerAction(w, r, "remove", docker.ContainerOps.RemoveContainer)
+}
+
+func (h *handler) containerAction(w http.ResponseWriter, r *http.Request, action string, run func(docker.ContainerOps, context.Context, string) error) {
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	if err := run(ops, r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusBadGateway, "container_action_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": action})
+}
+
+func (h *handler) getContainerMetrics(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, h.metrics.snapshot(time.Now()))
 }
 
@@ -388,27 +421,109 @@ func (h *handler) gateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.proxyContainer(w, r, d.ID, &url.URL{
+		Scheme: "http",
+		Host:   fmt.Sprintf("127.0.0.1:%d", ports[0].Host),
+	}, nil)
+}
+
+func (h *handler) sshGateway(w http.ResponseWriter, r *http.Request) {
+	if h.envs == nil {
+		writeError(w, http.StatusServiceUnavailable, "environment_unavailable", "remote environments are unavailable")
+		return
+	}
+	env, err := h.store.GetEnvironment(r.Context(), r.PathValue("environment"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "environment not found")
+		return
+	}
+	if err != nil {
+		h.internalError(w, err)
+		return
+	}
+	password, err := h.openCredential(env.SSHPassword)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", "could not decrypt the SSH password")
+		return
+	}
+	ops, err := h.envs.Remote(env.SSHHost, password)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	containers, err := ops.ListAllContainers(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "environment_unreachable", err.Error())
+		return
+	}
+	var container *docker.HostContainer
+	for i := range containers {
+		if containers[i].ID == r.PathValue("container") {
+			container = &containers[i]
+			break
+		}
+	}
+	if container == nil {
+		writeError(w, http.StatusNotFound, "not_found", "container not found")
+		return
+	}
+	if container.State != "running" {
+		writeError(w, http.StatusServiceUnavailable, "container_unavailable", "container is not running")
+		return
+	}
+	port, ok := firstPublishedTCPPort(container.Ports)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "port_unavailable", "container has no published TCP port")
+		return
+	}
+	target := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return h.envs.DialContext(ctx, env.SSHHost, password, target)
+	}}
+	defer transport.CloseIdleConnections()
+	h.proxyContainer(w, r, container.ID, &url.URL{Scheme: "http", Host: "remote-container"}, transport)
+}
+
+func firstPublishedTCPPort(ports []string) (int, bool) {
+	for _, binding := range ports {
+		public, rest, ok := strings.Cut(binding, ":")
+		if !ok || !strings.HasSuffix(rest, "/tcp") {
+			continue
+		}
+		port, err := strconv.Atoi(public)
+		if err == nil && port > 0 && port <= 65535 {
+			return port, true
+		}
+	}
+	return 0, false
+}
+
+func (h *handler) proxyContainer(w http.ResponseWriter, r *http.Request, container string, target *url.URL, transport http.RoundTripper) {
 	originalPath, originalRawPath := r.URL.Path, r.URL.RawPath
 	r.URL.Path = "/" + r.PathValue("path")
 	r.URL.RawPath = ""
-	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("127.0.0.1:%d", ports[0].Host),
-	})
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	if transport != nil {
+		proxy.Transport = transport
+	}
+	proxyFailed := false
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		h.logger.Error("gateway request failed", "deployment", d.ID, "error", err)
+		proxyFailed = true
+		h.logger.Error("gateway request failed", "container", container, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream_unavailable", "running container did not accept the request")
 	}
 	started := time.Now()
 	response := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 	proxy.ServeHTTP(response, r)
 	r.URL.Path, r.URL.RawPath = originalPath, originalRawPath
-	h.metrics.record(time.Now(), response.status, time.Since(started))
+	if !proxyFailed {
+		h.metrics.record(time.Now(), response.status, time.Since(started))
+	}
 }
 
-// resolveEnv picks the containerOps for ?env=<id>, defaulting to "local".
+// resolveEnv picks the container operations for ?env=<id>, defaulting to "local".
 // It writes the error response itself and returns ok=false on failure.
-func (h *handler) resolveEnv(w http.ResponseWriter, r *http.Request) (containerOps, bool) {
+func (h *handler) resolveEnv(w http.ResponseWriter, r *http.Request) (docker.ContainerOps, bool) {
 	id := r.URL.Query().Get("env")
 	if id == "" || id == "local" {
 		return h.docker, true
@@ -573,11 +688,7 @@ func (h *handler) deleteEnvironment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == "" {
-		token = r.URL.Query().Get("token")
-	}
-	if !h.validToken(token) {
+	if !h.validLogToken(r) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "valid token required")
 		return
 	}
@@ -591,13 +702,37 @@ func (h *handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "no_containers", "deployment has no running containers")
 		return
 	}
+	h.streamContainerLogs(w, r, h.docker, containers[0].ID)
+}
+
+func (h *handler) hostContainerLogs(w http.ResponseWriter, r *http.Request) {
+	if !h.validLogToken(r) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "valid token required")
+		return
+	}
+	ops, ok := h.resolveEnv(w, r)
+	if !ok {
+		return
+	}
+	h.streamContainerLogs(w, r, ops, r.PathValue("id"))
+}
+
+func (h *handler) validLogToken(r *http.Request) bool {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if token == "" {
+		token = r.URL.Query().Get("token")
+	}
+	return h.validToken(token)
+}
+
+func (h *handler) streamContainerLogs(w http.ResponseWriter, r *http.Request, ops docker.ContainerOps, id string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.internalError(w, errors.New("streaming unsupported"))
 		return
 	}
 
-	logs, err := h.docker.Logs(r.Context(), containers[0].ID, true)
+	logs, err := ops.Logs(r.Context(), id, true)
 	if err != nil {
 		h.internalError(w, err)
 		return
@@ -610,14 +745,16 @@ func (h *handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Container logs are multiplexed (no TTY); demux stdout+stderr into a pipe
-	// and forward line by line as SSE events.
-	pr, pw := io.Pipe()
-	go func() {
-		_, _ = stdcopy.StdCopy(pw, pw, logs)
-		pw.Close()
-	}()
-	scanner := bufio.NewScanner(pr)
+	var reader io.Reader = logs
+	if logs.Multiplexed {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = stdcopy.StdCopy(pw, pw, logs)
+			pw.Close()
+		}()
+		reader = pr
+	}
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		fmt.Fprintf(w, "data: %s\n\n", scanner.Text())
 		flusher.Flush()
@@ -768,11 +905,8 @@ func (h *handler) validToken(token string) bool {
 
 func (h *handler) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		started := time.Now()
-		response := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(response, r)
-		duration := time.Since(started)
-		h.logger.Info("http request", "method", r.Method, "path", r.URL.Path, "status", response.status, "duration", duration, "remote", r.RemoteAddr)
+		h.logger.Info("http request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -848,10 +982,9 @@ func (m *requestMetrics) snapshot(now time.Time) map[string]any {
 		averageLatency = float64(latency.Microseconds()) / 1000 / float64(requests)
 	}
 	return map[string]any{
-		"total_requests":       m.total,
-		"requests_last_minute": requests,
-		"average_latency_ms":   averageLatency,
-		"uptime_seconds":       int64(now.Sub(m.started).Seconds()),
+		"container_requests_total":       m.total,
+		"container_requests_last_minute": requests,
+		"container_average_latency_ms":   averageLatency,
 		"last_minute": map[string]uint64{
 			"success": statuses[0], "client_error": statuses[1], "server_error": statuses[2],
 		},

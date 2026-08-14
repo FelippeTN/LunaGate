@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/docker/cli/cli/connhelper"
+	"github.com/docker/cli/cli/connhelper/commandconn"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -29,10 +30,11 @@ import (
 )
 
 const (
-	labelManaged    = "lunagate.managed"
-	labelDeployment = "lunagate.deployment"
-	labelReplica    = "lunagate.replica"
-	labelImage      = "lunagate.image"
+	labelManaged        = "lunagate.managed"
+	labelDeployment     = "lunagate.deployment"
+	labelReplica        = "lunagate.replica"
+	labelImage          = "lunagate.image"
+	labelComposeProject = "com.docker.compose.project"
 )
 
 type Client struct{ cli *client.Client }
@@ -65,6 +67,7 @@ type HostContainer struct {
 	Ports   []string `json:"ports"`
 	Created int64    `json:"created"`
 	Managed bool     `json:"managed"`
+	Project string   `json:"project,omitempty"`
 	// Deployment lets a caller tally replicas per deployment from this one
 	// listing instead of one request per deployment.
 	Deployment string `json:"deployment,omitempty"`
@@ -75,6 +78,23 @@ type Image struct {
 	RepoTags []string `json:"repo_tags"`
 	Size     int64    `json:"size"`
 	Created  int64    `json:"created"`
+}
+
+type ContainerOps interface {
+	ListByDeployment(context.Context, string) ([]Container, error)
+	StopAndRemove(context.Context, string) error
+	Logs(context.Context, string, bool) (LogStream, error)
+	ListAllContainers(context.Context) ([]HostContainer, error)
+	ListImages(context.Context) ([]Image, error)
+	StartContainer(context.Context, string) error
+	StopContainer(context.Context, string) error
+	RestartContainer(context.Context, string) error
+	RemoveContainer(context.Context, string) error
+}
+
+type LogStream struct {
+	io.ReadCloser
+	Multiplexed bool
 }
 
 func New() (*Client, error) {
@@ -152,10 +172,10 @@ func NewSSH(sshHost, password string) (*Client, error) {
 	return &Client{cli: cli}, nil
 }
 
-func newPasswordSSH(sshHost, password string) (*Client, error) {
+func passwordSSHSettings(sshHost, password string) (string, *ssh.ClientConfig, error) {
 	target, err := url.Parse("ssh://" + sshHost)
 	if err != nil || target.User == nil || target.User.Username() == "" {
-		return nil, errors.New("password authentication requires user@host")
+		return "", nil, errors.New("password authentication requires user@host")
 	}
 	port := target.Port()
 	if port == "" {
@@ -164,17 +184,25 @@ func newPasswordSSH(sshHost, password string) (*Client, error) {
 	address := net.JoinHostPort(target.Hostname(), port)
 	knownHosts, err := knownHostsFile()
 	if err != nil {
-		return nil, fmt.Errorf("find SSH home: %w", err)
+		return "", nil, fmt.Errorf("find SSH home: %w", err)
 	}
 	hostKeyCallback, err := knownhosts.New(knownHosts)
 	if err != nil {
-		return nil, fmt.Errorf("read known_hosts: %w", err)
+		return "", nil, fmt.Errorf("read known_hosts: %w", err)
 	}
 	config := &ssh.ClientConfig{
 		User:            target.User.Username(),
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         8 * time.Second,
+	}
+	return address, config, nil
+}
+
+func newPasswordSSH(sshHost, password string) (*Client, error) {
+	address, config, err := passwordSSHSettings(sshHost, password)
+	if err != nil {
+		return nil, err
 	}
 	dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
 		dialer := net.Dialer{Timeout: 8 * time.Second}
@@ -214,6 +242,60 @@ func newPasswordSSH(sshHost, password string) (*Client, error) {
 		return conn, nil
 	}
 	return newClientWithDialer(dial)
+}
+
+// DialSSH opens a TCP stream on the remote host. It uses the same SSH
+// authentication rules as the remote Docker connection.
+func DialSSH(ctx context.Context, sshHost, password, target string) (net.Conn, error) {
+	if password == "" {
+		if err := ensureSSHOnce(); err != nil {
+			return nil, err
+		}
+		u, err := url.Parse("ssh://" + sshHost)
+		if err != nil || u.Hostname() == "" {
+			return nil, errors.New("invalid SSH host")
+		}
+		args := []string{"-T", "-o", "ConnectTimeout=8"}
+		if u.User != nil && u.User.Username() != "" {
+			args = append(args, "-l", u.User.Username())
+		}
+		if u.Port() != "" {
+			args = append(args, "-p", u.Port())
+		}
+		args = append(args, "-W", target, "--", u.Hostname())
+		return commandconn.New(ctx, "ssh", args...)
+	}
+
+	address, config, err := passwordSSHSettings(sshHost, password)
+	if err != nil {
+		return nil, err
+	}
+	tcp, err := (&net.Dialer{Timeout: 8 * time.Second}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	connection, channels, requests, err := ssh.NewClientConn(tcp, address, config)
+	if err != nil {
+		tcp.Close()
+		return nil, err
+	}
+	client := ssh.NewClient(connection, channels, requests)
+	remote, err := client.DialContext(ctx, "tcp", target)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	return &sshTunnelConn{Conn: remote, client: client}, nil
+}
+
+type sshTunnelConn struct {
+	net.Conn
+	client *ssh.Client
+}
+
+func (c *sshTunnelConn) Close() error {
+	err := c.Conn.Close()
+	return errors.Join(err, c.client.Close())
 }
 
 func newClientWithDialer(dial func(context.Context, string, string) (net.Conn, error)) (*Client, error) {
@@ -272,7 +354,7 @@ func NewManager(local *Client) *Manager {
 
 func (m *Manager) Local() *Client { return m.local }
 
-func (m *Manager) Remote(sshHost, password string) (*Client, error) {
+func (m *Manager) Remote(sshHost, password string) (ContainerOps, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if c, ok := m.cache[sshHost]; ok {
@@ -284,6 +366,10 @@ func (m *Manager) Remote(sshHost, password string) (*Client, error) {
 	}
 	m.cache[sshHost] = c
 	return c, nil
+}
+
+func (m *Manager) DialContext(ctx context.Context, sshHost, password, target string) (net.Conn, error) {
+	return DialSSH(ctx, sshHost, password, target)
 }
 
 // Forget closes and evicts a cached remote client, e.g. when its environment
@@ -374,6 +460,22 @@ func (c *Client) StopAndRemove(ctx context.Context, id string) error {
 	return c.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true})
 }
 
+func (c *Client) StartContainer(ctx context.Context, id string) error {
+	return c.cli.ContainerStart(ctx, id, container.StartOptions{})
+}
+
+func (c *Client) StopContainer(ctx context.Context, id string) error {
+	return c.cli.ContainerStop(ctx, id, container.StopOptions{})
+}
+
+func (c *Client) RestartContainer(ctx context.Context, id string) error {
+	return c.cli.ContainerRestart(ctx, id, container.StopOptions{})
+}
+
+func (c *Client) RemoveContainer(ctx context.Context, id string) error {
+	return c.cli.ContainerRemove(ctx, id, container.RemoveOptions{})
+}
+
 func (c *Client) ListByDeployment(ctx context.Context, deploymentID string) ([]Container, error) {
 	args := filters.NewArgs(
 		filters.Arg("label", labelManaged+"=true"),
@@ -394,8 +496,8 @@ func (c *Client) ListByDeployment(ctx context.Context, deploymentID string) ([]C
 	return out, nil
 }
 
-// ListAllContainers is read-only: it never mutates a container LunaGate
-// doesn't own.
+// ListAllContainers returns both managed and external containers so the host
+// panel can inspect and control the selected Docker environment.
 func (c *Client) ListAllContainers(ctx context.Context) ([]HostContainer, error) {
 	list, err := c.cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
@@ -420,6 +522,7 @@ func (c *Client) ListAllContainers(ctx context.Context) ([]HostContainer, error)
 			Ports:      ports,
 			Created:    item.Created,
 			Managed:    item.Labels[labelManaged] == "true",
+			Project:    item.Labels[labelComposeProject],
 			Deployment: item.Labels[labelDeployment],
 		})
 	}
@@ -448,11 +551,16 @@ func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
 }
 
 // Logs streams a container's combined stdout/stderr. Caller must close.
-func (c *Client) Logs(ctx context.Context, id string, follow bool) (io.ReadCloser, error) {
-	return c.cli.ContainerLogs(ctx, id, container.LogsOptions{
+func (c *Client) Logs(ctx context.Context, id string, follow bool) (LogStream, error) {
+	inspected, err := c.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return LogStream{}, err
+	}
+	logs, err := c.cli.ContainerLogs(ctx, id, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     follow,
 		Tail:       "200",
 	})
+	return LogStream{ReadCloser: logs, Multiplexed: inspected.Config == nil || !inspected.Config.Tty}, err
 }
